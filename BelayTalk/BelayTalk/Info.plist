@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>BelayTalk needs microphone access for voice communication with your climbing partner.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>BelayTalk uses the local network to connect with your climbing partner's device.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_belaytalk._tcp</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+</dict>
+</plist>
