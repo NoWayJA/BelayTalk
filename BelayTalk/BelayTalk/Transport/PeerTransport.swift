@@ -16,7 +16,7 @@ nonisolated protocol PeerTransportDelegate: AnyObject, Sendable {
 /// MultipeerConnectivity wrapper enforcing single-peer sessions.
 ///
 /// - Service type: `"belaytalk"`
-/// - Encryption: `.required`
+/// - Encryption: `.optional` (DTLS when possible, graceful fallback)
 /// - Audio sent `.unreliable`, control sent `.reliable`
 /// - Rejects third connections
 nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
@@ -32,6 +32,7 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
         var connectedPeer: MCPeerID?
         var isHosting = false
         var isBrowsing = false
+        var autoInviteOnDiscover = false
     }
 
     weak var delegate: PeerTransportDelegate?
@@ -41,9 +42,9 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     let discoveredPeers: AsyncStream<[MCPeerID]>
     private var _discoveredPeers: [MCPeerID] = []
 
-    /// Invitation handler for incoming connections
-    private let invitationContinuation: AsyncStream<(MCPeerID, @Sendable (Bool) -> Void)>.Continuation
-    let incomingInvitations: AsyncStream<(MCPeerID, @Sendable (Bool) -> Void)>
+    /// Notifies when a peer's invitation was auto-accepted (for UI feedback)
+    private let autoAcceptedPeerContinuation: AsyncStream<MCPeerID>.Continuation
+    let autoAcceptedPeers: AsyncStream<MCPeerID>
 
     @MainActor override init() {
         let displayName = UIDevice.current.name
@@ -53,16 +54,16 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
         discoveredPeers = AsyncStream { dpC = $0 }
         discoveredPeersContinuation = dpC
 
-        var invC: AsyncStream<(MCPeerID, @Sendable (Bool) -> Void)>.Continuation!
-        incomingInvitations = AsyncStream { invC = $0 }
-        invitationContinuation = invC
+        var aaC: AsyncStream<MCPeerID>.Continuation!
+        autoAcceptedPeers = AsyncStream { aaC = $0 }
+        autoAcceptedPeerContinuation = aaC
 
         super.init()
 
         session = MCSession(
             peer: localPeerID,
             securityIdentity: nil,
-            encryptionPreference: .required
+            encryptionPreference: .optional
         )
         session.delegate = self
     }
@@ -72,7 +73,7 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
         stopBrowsing()
         session.disconnect()
         discoveredPeersContinuation.finish()
-        invitationContinuation.finish()
+        autoAcceptedPeerContinuation.finish()
     }
 
     // MARK: - Host (Advertise)
@@ -123,6 +124,11 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
         Log.transport.info("Invited peer: \(peer.displayName)")
     }
 
+    /// When set, the next discovered peer will be auto-invited (used during reconnection).
+    func setAutoInviteOnDiscover(_ enabled: Bool) {
+        lock.withLock { $0.autoInviteOnDiscover = enabled }
+    }
+
     // MARK: - Send
 
     func sendAudio(header: AudioFrameHeader, payload: Data) {
@@ -147,6 +153,20 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
         session.disconnect()
         lock.withLock { $0.connectedPeer = nil }
         Log.transport.info("Disconnected")
+    }
+
+    /// Recreate the internal MCSession for clean reconnection.
+    /// A disconnected MCSession may be in a terminal state and unable to accept new connections.
+    @MainActor func recreateSession() {
+        session.disconnect()
+        session = MCSession(
+            peer: localPeerID,
+            securityIdentity: nil,
+            encryptionPreference: .optional
+        )
+        session.delegate = self
+        lock.withLock { $0.connectedPeer = nil }
+        Log.transport.info("MCSession recreated for reconnection")
     }
 
     var connectedPeerName: String? {
@@ -181,6 +201,8 @@ extension PeerTransport: MCSessionDelegate {
             if wasConnected {
                 Log.transport.warning("Peer disconnected: \(peerID.displayName)")
                 delegate?.transport(self, peerDidDisconnect: peerID)
+            } else {
+                Log.transport.warning("Peer connection attempt failed: \(peerID.displayName)")
             }
 
         case .connecting:
@@ -228,11 +250,16 @@ extension PeerTransport: MCNearbyServiceAdvertiserDelegate {
             return
         }
 
-        let session = self.session!
-        let handler: @Sendable (Bool) -> Void = { accept in
-            invitationHandler(accept, accept ? session : nil)
-        }
-        invitationContinuation.yield((peerID, handler))
+        // Auto-accept immediately — the host chose to host a 2-person intercom,
+        // so any peer running BelayTalk should be accepted without delay.
+        // Routing through async UI caused MC channel negotiation timeouts.
+        Log.transport.info("Auto-accepting invitation from \(peerID.displayName)")
+        invitationHandler(true, session)
+        autoAcceptedPeerContinuation.yield(peerID)
+    }
+
+    nonisolated func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
+        Log.transport.error("Failed to start advertising: \(error.localizedDescription)")
     }
 }
 
@@ -247,11 +274,27 @@ extension PeerTransport: MCNearbyServiceBrowserDelegate {
         _discoveredPeers.append(peerID)
         discoveredPeersContinuation.yield(_discoveredPeers)
         Log.transport.info("Found peer: \(peerID.displayName)")
+
+        let shouldAutoInvite = lock.withLock { state in
+            if state.autoInviteOnDiscover {
+                state.autoInviteOnDiscover = false
+                return true
+            }
+            return false
+        }
+        if shouldAutoInvite {
+            invite(peer: peerID)
+            Log.transport.info("Auto-invited peer for reconnection: \(peerID.displayName)")
+        }
     }
 
     nonisolated func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
         _discoveredPeers.removeAll { $0 == peerID }
         discoveredPeersContinuation.yield(_discoveredPeers)
         Log.transport.info("Lost peer: \(peerID.displayName)")
+    }
+
+    nonisolated func browser(_ browser: MCNearbyServiceBrowser, didNotStartBrowsingForPeers error: Error) {
+        Log.transport.error("Failed to start browsing: \(error.localizedDescription)")
     }
 }

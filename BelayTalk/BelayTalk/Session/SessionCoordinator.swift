@@ -32,6 +32,7 @@ final class SessionCoordinator {
     // MARK: - Task Management
 
     private var monitorTasks: [Task<Void, Never>] = []
+    private var reconnectionAttempted = false
 
     init() {
         audioEngine.delegate = self
@@ -49,6 +50,14 @@ final class SessionCoordinator {
         sessionState = .permissions
         let granted = await AVAudioApplication.requestRecordPermission()
         if granted {
+            // Pre-configure audio session so route changes settle before MC connects.
+            // Activating .voiceChat mode after MC is connected can disrupt the radio stack.
+            do {
+                try routeManager.configureSession()
+                Log.session.info("Audio session pre-configured, route: \(self.routeManager.currentRoute.rawValue)")
+            } catch {
+                Log.session.warning("Audio session pre-configure failed: \(error.localizedDescription)")
+            }
             sessionState = .ready
             Log.session.info("Microphone permission granted")
         } else {
@@ -63,7 +72,7 @@ final class SessionCoordinator {
         role = .host
         sessionState = .connecting
         transport.startAdvertising()
-        Log.session.info("Hosting session")
+        Log.session.info("Hosting session — auto-accepting connections")
     }
 
     func joinSession() {
@@ -186,6 +195,8 @@ final class SessionCoordinator {
         metrics.markSessionStart()
 
         do {
+            // Audio session was pre-configured in requestPermissions().
+            // Re-configure here only as a safety net (idempotent).
             try routeManager.configureSession()
             routeState = routeManager.currentRoute
             try audioEngine.start()
@@ -261,7 +272,26 @@ final class SessionCoordinator {
         case .reconnect:
             sessionState = .reconnecting
             metrics.incrementReconnectCount()
-            // Transport will attempt to reconnect via MPC auto-reconnect
+
+            // Only set up advertising/browsing on the first attempt.
+            // Subsequent recovery ticks should not recreateSession() —
+            // that kills any MC negotiation in flight.
+            guard !reconnectionAttempted else {
+                Log.session.info("Recovery: already advertising/browsing, waiting for connection")
+                return
+            }
+            reconnectionAttempted = true
+
+            audioEngine.stop()
+            transport.recreateSession()
+            if role == .host {
+                transport.startAdvertising()
+                Log.session.info("Recovery: re-advertising as host")
+            } else {
+                transport.setAutoInviteOnDiscover(true)
+                transport.startBrowsing()
+                Log.session.info("Recovery: re-browsing as guest (will auto-invite)")
+            }
 
         case .routeDegraded(let route):
             routeState = route
@@ -309,6 +339,7 @@ final class SessionCoordinator {
         txState = .disabled
         connectedPeerName = nil
         role = nil
+        reconnectionAttempted = false
 
         Log.session.info("Session torn down")
     }
@@ -353,6 +384,8 @@ extension SessionCoordinator: PeerTransportDelegate {
             self.connectedPeerName = peerID.displayName
             self.transport.stopAdvertising()
             self.transport.stopBrowsing()
+            self.recovery.handleReconnectSucceeded()
+            self.reconnectionAttempted = false
             Log.session.info("Peer connected: \(peerID.displayName)")
             self.startHandshake()
         }
