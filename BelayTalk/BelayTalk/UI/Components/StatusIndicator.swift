@@ -21,7 +21,7 @@ struct StatusIndicator: View {
             .green
         case .connecting, .reconnecting, .interrupted:
             .orange
-        case .ended, .routeFailed:
+        case .ended, .ending, .routeFailed:
             .red
         case .idle, .permissions, .ready:
             .gray

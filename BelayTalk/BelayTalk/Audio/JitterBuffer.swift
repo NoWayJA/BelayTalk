@@ -5,8 +5,12 @@ import os
 ///
 /// Buffers frames by sequence number to smooth out network jitter.
 /// Default depth: 60ms (3 frames at 20ms). Adaptive range: 40-120ms.
+/// Max buffer cap prevents unbounded accumulation.
 nonisolated final class JitterBuffer: @unchecked Sendable {
     private let lock = OSAllocatedUnfairLock<State>(initialState: State())
+
+    /// Absolute maximum frames in the buffer. Beyond this we skip ahead.
+    private static let maxBufferSize = 15  // 300ms — well beyond max jitter depth
 
     private struct State {
         var buffer: [UInt32: Data] = [:]
@@ -16,6 +20,7 @@ nonisolated final class JitterBuffer: @unchecked Sendable {
         var maxDepth: Int = 6   // 120ms
         var latePackets: UInt64 = 0
         var initialized = false
+        var highestInsertedSeq: UInt32 = 0
     }
 
     /// Insert a frame into the buffer. Returns true if accepted, false if late/duplicate.
@@ -23,11 +28,13 @@ nonisolated final class JitterBuffer: @unchecked Sendable {
         lock.withLock { state in
             if !state.initialized {
                 state.nextExpectedSeq = sequenceNumber
+                state.highestInsertedSeq = sequenceNumber
                 state.initialized = true
             }
 
-            // Drop late packets (sequence number < next expected)
-            if sequenceNumber < state.nextExpectedSeq {
+            // Drop late packets using signed distance for UInt32 wrap-around safety
+            let distance = Int32(bitPattern: sequenceNumber &- state.nextExpectedSeq)
+            if distance < 0 {
                 state.latePackets += 1
                 return false
             }
@@ -38,11 +45,23 @@ nonisolated final class JitterBuffer: @unchecked Sendable {
             }
 
             state.buffer[sequenceNumber] = payload
+
+            // Track highest inserted sequence for skip-ahead
+            let highDist = Int32(bitPattern: sequenceNumber &- state.highestInsertedSeq)
+            if highDist > 0 {
+                state.highestInsertedSeq = sequenceNumber
+            }
+
+            // Cap buffer size: if too many frames accumulated, skip ahead
+            if state.buffer.count > Self.maxBufferSize {
+                skipAhead(&state)
+            }
+
             return true
         }
     }
 
-    /// Pull the next frame in sequence order. Returns nil if not yet available (silence fill).
+    /// Pull the next frame in sequence order. Returns nil if not yet available.
     func pull() -> Data? {
         lock.withLock { state in
             guard state.initialized else { return nil }
@@ -61,6 +80,22 @@ nonisolated final class JitterBuffer: @unchecked Sendable {
 
             // Missing frame — caller should fill with silence
             return nil
+        }
+    }
+
+    /// Skip ahead to near the latest frame, discarding stale data.
+    private func skipAhead(_ state: inout State) {
+        // Jump nextExpectedSeq to (highestInserted - depthFrames) so we keep
+        // only the most recent frames in the buffer
+        let target = state.highestInsertedSeq &- UInt32(state.depthFrames)
+        state.nextExpectedSeq = target
+
+        // Remove all frames older than the new expected sequence
+        let keysToRemove = state.buffer.keys.filter { key in
+            Int32(bitPattern: key &- target) < 0
+        }
+        for key in keysToRemove {
+            state.buffer.removeValue(forKey: key)
         }
     }
 
@@ -88,6 +123,7 @@ nonisolated final class JitterBuffer: @unchecked Sendable {
         lock.withLock { state in
             state.buffer.removeAll()
             state.nextExpectedSeq = 0
+            state.highestInsertedSeq = 0
             state.depthFrames = 3
             state.latePackets = 0
             state.initialized = false

@@ -57,6 +57,19 @@ nonisolated final class VoiceActivityDetector: VoiceActivityDetecting, @unchecke
         }
     }
 
+    /// Reset VAD state for a fresh session (clears filter state and energy history).
+    func reset() {
+        lock.withLock { state in
+            state.energyHistory.reset()
+            state.noiseFloor = 0.001
+            state.isVoiceActive = false
+            state.hangRemaining = 0
+            state.lastProcessTime = .now
+            state.hpPrevInput = 0
+            state.hpPrevOutput = 0
+        }
+    }
+
     func process(_ buffer: AVAudioPCMBuffer) {
         guard let floatData = buffer.floatChannelData?[0] else { return }
         let frameCount = Int(buffer.frameLength)
@@ -69,6 +82,14 @@ nonisolated final class VoiceActivityDetector: VoiceActivityDetecting, @unchecke
             let now = Date()
             let dt = now.timeIntervalSince(state.lastProcessTime)
             state.lastProcessTime = now
+
+            // Update noise floor BEFORE processing the new frame
+            // so the current frame doesn't inflate the noise floor estimate
+            if state.energyHistory.count > 10 {
+                let sorted = state.energyHistory.elements.sorted()
+                let lowerQuartile = sorted[sorted.count / 4]
+                state.noiseFloor = max(0.0005, lowerQuartile * 1.5)
+            }
 
             // Compute RMS energy
             var energy: Float = 0
@@ -88,13 +109,8 @@ nonisolated final class VoiceActivityDetector: VoiceActivityDetecting, @unchecke
             }
             energy = sqrt(energy / Float(frameCount))
 
-            // Update energy history and noise floor
+            // Update energy history after noise floor computation
             state.energyHistory.append(energy)
-            if state.energyHistory.count > 10 {
-                let sorted = state.energyHistory.elements.sorted()
-                let lowerQuartile = sorted[sorted.count / 4]
-                state.noiseFloor = max(0.0005, lowerQuartile * 1.5)
-            }
 
             // Voice detection threshold
             let threshold = state.noiseFloor * state.sensitivity.thresholdMultiplier * 3.0

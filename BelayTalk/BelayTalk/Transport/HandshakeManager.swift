@@ -1,15 +1,18 @@
 import Foundation
 import OSLog
+import os
 
 /// Handshake state machine: HELLO → HELLO_ACK → CAPS → READY → START
 ///
 /// 5-second timeout per step. Version/capability validation during CAPS exchange.
+/// All mutable state is protected by a lock for thread safety.
 nonisolated final class HandshakeManager: @unchecked Sendable {
     enum HandshakeState: String, Sendable {
         case idle
         case sentHello
         case sentHelloAck
         case sentCaps
+        case receivedCaps  // Guest: received CAPS from host, waiting for READY
         case sentReady
         case completed
         case failed
@@ -26,11 +29,17 @@ nonisolated final class HandshakeManager: @unchecked Sendable {
     private let isHost: Bool
     private let stepTimeout: TimeInterval = 5.0
 
-    private(set) var state: HandshakeState = .idle
-    private(set) var remoteCaps: Capabilities?
+    private let lock = OSAllocatedUnfairLock<MutableState>(initialState: MutableState())
+    private struct MutableState {
+        var state: HandshakeState = .idle
+        var remoteCaps: Capabilities?
+        var timeoutTask: Task<Void, Never>?
+        var completion: ((Result<Capabilities, HandshakeError>) -> Void)?
+    }
 
-    private var timeoutTask: Task<Void, Never>?
-    private var completion: ((Result<Capabilities, HandshakeError>) -> Void)?
+    var state: HandshakeState {
+        lock.withLock { $0.state }
+    }
 
     init(transport: PeerTransport, isHost: Bool) {
         self.transport = transport
@@ -40,8 +49,10 @@ nonisolated final class HandshakeManager: @unchecked Sendable {
     // MARK: - Start Handshake
 
     func start(completion: @escaping (Result<Capabilities, HandshakeError>) -> Void) {
-        self.completion = completion
-        state = .idle
+        lock.withLock { state in
+            state.completion = completion
+            state.state = .idle
+        }
 
         if isHost {
             // Host waits for HELLO from guest
@@ -49,7 +60,7 @@ nonisolated final class HandshakeManager: @unchecked Sendable {
         } else {
             // Guest sends HELLO
             transport.sendControl(ControlFrame(message: .hello))
-            state = .sentHello
+            lock.withLock { $0.state = .sentHello }
             startTimeout()
             Log.transport.info("Handshake: sent HELLO")
         }
@@ -60,19 +71,21 @@ nonisolated final class HandshakeManager: @unchecked Sendable {
     func receive(_ frame: ControlFrame) {
         cancelTimeout()
 
-        switch (state, frame.message, isHost) {
+        let currentState = lock.withLock { $0.state }
+
+        switch (currentState, frame.message, isHost) {
 
         // Host receives HELLO → sends HELLO_ACK
         case (.idle, .hello, true):
             transport.sendControl(ControlFrame(message: .helloAck))
-            state = .sentHelloAck
+            lock.withLock { $0.state = .sentHelloAck }
             startTimeout()
             Log.transport.info("Handshake: received HELLO, sent HELLO_ACK")
 
         // Guest receives HELLO_ACK → sends CAPS
         case (.sentHello, .helloAck, false):
             sendCaps()
-            state = .sentCaps
+            lock.withLock { $0.state = .sentCaps }
             startTimeout()
             Log.transport.info("Handshake: received HELLO_ACK, sent CAPS")
 
@@ -83,38 +96,51 @@ nonisolated final class HandshakeManager: @unchecked Sendable {
                 return
             }
             guard validateCaps(caps) else { return }
-            remoteCaps = caps
+            lock.withLock { $0.remoteCaps = caps }
             sendCaps()
             transport.sendControl(ControlFrame(message: .ready))
-            state = .sentReady
+            lock.withLock { $0.state = .sentReady }
             startTimeout()
             Log.transport.info("Handshake: received CAPS, sent CAPS + READY")
 
-        // Guest receives CAPS
+        // Guest receives CAPS → transition to .receivedCaps
         case (.sentCaps, .caps, false):
             guard let caps = decodeCaps(from: frame) else {
                 fail(.unexpectedMessage("Invalid CAPS payload"))
                 return
             }
             guard validateCaps(caps) else { return }
-            remoteCaps = caps
+            lock.withLock { state in
+                state.remoteCaps = caps
+                state.state = .receivedCaps
+            }
+            startTimeout()
             Log.transport.info("Handshake: received CAPS from host")
 
-        // Guest receives READY → sends START
+        // Guest receives READY (after CAPS) → sends START
+        case (.receivedCaps, .ready, false):
+            transport.sendControl(ControlFrame(message: .start))
+            lock.withLock { $0.state = .completed }
+            Log.transport.info("Handshake: received READY, sent START — complete")
+            succeed()
+
+        // Guest receives READY before CAPS (CAPS and READY sent back-to-back)
+        // This handles the case where reliable messages arrive in order but
+        // we haven't processed CAPS yet due to timing
         case (.sentCaps, .ready, false):
             transport.sendControl(ControlFrame(message: .start))
-            state = .completed
-            Log.transport.info("Handshake: received READY, sent START — complete")
+            lock.withLock { $0.state = .completed }
+            Log.transport.info("Handshake: received READY (before CAPS), sent START — complete")
             succeed()
 
         // Host receives START → complete
         case (.sentReady, .start, true):
-            state = .completed
+            lock.withLock { $0.state = .completed }
             Log.transport.info("Handshake: received START — complete")
             succeed()
 
         default:
-            Log.transport.warning("Handshake: unexpected \(frame.message.rawValue) in state \(self.state.rawValue)")
+            Log.transport.warning("Handshake: unexpected \(frame.message.rawValue) in state \(currentState.rawValue)")
         }
     }
 
@@ -158,39 +184,58 @@ nonisolated final class HandshakeManager: @unchecked Sendable {
     // MARK: - Timeout
 
     private func startTimeout() {
-        timeoutTask = Task { [weak self, stepTimeout] in
+        let task = Task { [weak self, stepTimeout] in
             try? await Task.sleep(for: .seconds(stepTimeout))
             guard !Task.isCancelled else { return }
             self?.fail(.timeout)
         }
+        lock.withLock { $0.timeoutTask = task }
     }
 
     private func cancelTimeout() {
-        timeoutTask?.cancel()
-        timeoutTask = nil
+        lock.withLock { state in
+            state.timeoutTask?.cancel()
+            state.timeoutTask = nil
+        }
     }
 
     // MARK: - Completion
 
     private func succeed() {
         cancelTimeout()
-        let caps = remoteCaps ?? Capabilities.current
+        let (caps, completion) = lock.withLock { state -> (Capabilities, ((Result<Capabilities, HandshakeError>) -> Void)?) in
+            let c = state.remoteCaps ?? Capabilities.current
+            let cb = state.completion
+            state.completion = nil
+            return (c, cb)
+        }
         completion?(.success(caps))
-        completion = nil
     }
 
     private func fail(_ error: HandshakeError) {
         cancelTimeout()
-        state = .failed
+        let completion = lock.withLock { state -> ((Result<Capabilities, HandshakeError>) -> Void)? in
+            guard state.state != .failed else { return nil }  // Prevent double-fire
+            state.state = .failed
+            let cb = state.completion
+            state.completion = nil
+            return cb
+        }
         Log.transport.error("Handshake failed: \(String(describing: error))")
         completion?(.failure(error))
-        completion = nil
     }
 
     func reset() {
-        cancelTimeout()
-        state = .idle
-        remoteCaps = nil
-        completion = nil
+        let completion = lock.withLock { state -> ((Result<Capabilities, HandshakeError>) -> Void)? in
+            state.timeoutTask?.cancel()
+            state.timeoutTask = nil
+            let cb = state.completion
+            state.state = .idle
+            state.remoteCaps = nil
+            state.completion = nil
+            return cb
+        }
+        // Notify any waiting caller that the handshake was cancelled
+        completion?(.failure(.timeout))
     }
 }

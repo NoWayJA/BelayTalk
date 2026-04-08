@@ -33,6 +33,9 @@ nonisolated final class RemoteControlHandler: RemoteControlHandling, @unchecked 
     }
 
     func activate() {
+        // Deactivate first to prevent accumulating duplicate targets
+        deactivate()
+
         // Set minimal now-playing info so remote commands are delivered
         let info: [String: Any] = [
             MPMediaItemPropertyTitle: "BelayTalk",

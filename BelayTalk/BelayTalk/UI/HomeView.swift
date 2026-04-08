@@ -35,6 +35,7 @@ struct HomeView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
+                    .disabled(coordinator.sessionState != .ready)
 
                     Button {
                         coordinator.joinSession()
@@ -46,6 +47,7 @@ struct HomeView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
+                    .disabled(coordinator.sessionState != .ready)
                 }
 
                 Spacer()
@@ -68,14 +70,15 @@ struct HomeView: View {
             }
             .padding(.horizontal, 24)
             .navigationTitle("")
-            .navigationDestination(for: String.self) { _ in }
             .task {
-                if coordinator.sessionState == .idle {
+                switch coordinator.sessionState {
+                case .idle:
                     _ = await coordinator.requestPermissions()
+                case .ended:
+                    coordinator.prepareForNewSession()
+                default:
+                    break
                 }
-            }
-            .onChange(of: coordinator.sessionState) { _, newState in
-                // Navigation handled by the app-level state
             }
         }
     }

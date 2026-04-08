@@ -21,12 +21,16 @@ nonisolated final class AudioEngine: @unchecked Sendable {
     private let playerNode = AVAudioPlayerNode()
     private let jitterBuffer = JitterBuffer()
 
+    /// Maximum number of buffers queued on the player node to prevent unbounded latency.
+    private static let maxScheduledBuffers = 4
+
     private let lock = OSAllocatedUnfairLock<State>(initialState: State())
     private struct State {
         var sequenceNumber: UInt32 = 0
         var isRunning = false
         var isMuted = false
         var playbackTimer: DispatchSourceTimer?
+        var scheduledBufferCount = 0
     }
 
     weak var delegate: AudioEngineDelegate?
@@ -34,6 +38,12 @@ nonisolated final class AudioEngine: @unchecked Sendable {
     // MARK: - Start / Stop
 
     func start() throws {
+        // Guard against double-start
+        if lock.withLock({ $0.isRunning }) {
+            Log.audio.warning("AudioEngine.start() called while already running — ignoring")
+            return
+        }
+
         let inputNode = engine.inputNode
 
         try inputNode.setVoiceProcessingEnabled(true)
@@ -59,23 +69,33 @@ nonisolated final class AudioEngine: @unchecked Sendable {
         try engine.start()
         playerNode.play()
 
-        lock.withLock { $0.isRunning = true }
+        lock.withLock { state in
+            state.isRunning = true
+            state.scheduledBufferCount = 0
+        }
         startPlaybackPump()
 
         Log.audio.info("AudioEngine started (hardware: \(hardwareFormat.sampleRate)Hz)")
     }
 
     func stop() {
-        lock.withLock { state in
+        let timer: DispatchSourceTimer? = lock.withLock { state in
+            guard state.isRunning else { return nil }
             state.isRunning = false
-            state.playbackTimer?.cancel()
+            let t = state.playbackTimer
             state.playbackTimer = nil
+            state.scheduledBufferCount = 0
+            return t
         }
+
+        // Cancel timer outside the lock, then wait a tick for any in-flight handler
+        timer?.cancel()
 
         engine.inputNode.removeTap(onBus: 0)
         playerNode.stop()
         engine.stop()
         jitterBuffer.reset()
+        AudioFormatConverter.resetConverter()
 
         Log.audio.info("AudioEngine stopped")
     }
@@ -170,16 +190,20 @@ nonisolated final class AudioEngine: @unchecked Sendable {
     private func pumpPlayback() {
         guard lock.withLock({ $0.isRunning }) else { return }
 
+        // Don't queue more buffers than the cap — prevents unbounded latency buildup
+        let currentCount = lock.withLock { $0.scheduledBufferCount }
+        guard currentCount < Self.maxScheduledBuffers else { return }
+
         if let wireData = jitterBuffer.pull() {
             // Convert Int16 wire data → Float32 for playback
             if let playBuffer = AudioFormatConverter.int16DataToFloat32(wireData) {
-                playerNode.scheduleBuffer(playBuffer)
-            }
-        } else {
-            // Silence fill — schedule silence buffer to keep pipeline running
-            if let silence = AudioFormatConverter.silenceBuffer() {
-                playerNode.scheduleBuffer(silence)
+                lock.withLock { $0.scheduledBufferCount += 1 }
+                playerNode.scheduleBuffer(playBuffer) { [weak self] in
+                    self?.lock.withLock { $0.scheduledBufferCount -= 1 }
+                }
             }
         }
+        // No silence fill — just skip the cycle if no data.
+        // The player node stays running and will play the next buffer when available.
     }
 }

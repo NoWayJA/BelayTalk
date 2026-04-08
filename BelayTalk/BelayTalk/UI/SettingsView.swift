@@ -16,6 +16,7 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.menu)
             }
+            .onChange(of: settings.txMode) { _, newMode in coordinator.updateTXMode(newMode) }
 
             Section("Voice Activity Detection") {
                 Picker("Sensitivity", selection: $settings.vadSensitivity) {

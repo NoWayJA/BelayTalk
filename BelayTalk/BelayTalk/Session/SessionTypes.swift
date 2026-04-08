@@ -12,6 +12,7 @@ nonisolated enum SessionState: String, Sendable {
     case reconnecting
     case interrupted
     case routeFailed
+    case ending
     case ended
 }
 

@@ -25,7 +25,7 @@ struct BelayTalkApp: App {
                     } else {
                         waitingView
                     }
-                case .active, .reconnecting, .interrupted, .routeFailed:
+                case .active, .reconnecting, .interrupted, .routeFailed, .ending:
                     SessionView()
                 case .ended:
                     HomeView()

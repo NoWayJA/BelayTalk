@@ -28,6 +28,7 @@ struct ConnectionStatusBadge: View {
         case .reconnecting: "Reconnecting…"
         case .interrupted: "Interrupted"
         case .routeFailed: "Route Failed"
+        case .ending: "Ending…"
         case .ended: "Ended"
         }
     }

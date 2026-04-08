@@ -33,6 +33,8 @@ final class SessionCoordinator {
 
     private var monitorTasks: [Task<Void, Never>] = []
     private var reconnectionAttempted = false
+    /// Timeout task for reconnection — if peer doesn't reconnect in time, schedule next attempt.
+    private var reconnectTimeoutTask: Task<Void, Never>?
 
     init() {
         audioEngine.delegate = self
@@ -50,21 +52,26 @@ final class SessionCoordinator {
         sessionState = .permissions
         let granted = await AVAudioApplication.requestRecordPermission()
         if granted {
-            // Pre-configure audio session so route changes settle before MC connects.
-            // Activating .voiceChat mode after MC is connected can disrupt the radio stack.
-            do {
-                try routeManager.configureSession()
-                Log.session.info("Audio session pre-configured, route: \(self.routeManager.currentRoute.rawValue)")
-            } catch {
-                Log.session.warning("Audio session pre-configure failed: \(error.localizedDescription)")
-            }
+            // Do NOT configure the audio session here. Activating .voiceChat mode
+            // starts voice processing which interferes with the AWDL radio that
+            // MultipeerConnectivity uses for discovery and connection.
+            // Audio session is configured in beginActiveSession() after handshake.
             sessionState = .ready
             Log.session.info("Microphone permission granted")
         } else {
-            sessionState = .ended
+            sessionState = .idle
             Log.session.error("Microphone permission denied")
         }
         return granted
+    }
+
+    /// Prepare coordinator for a new session (reset state from .ended to .ready).
+    func prepareForNewSession() {
+        guard sessionState == .ended else { return }
+        transport.recreateSession()
+        metrics.reset()
+        sessionState = .ready
+        Log.session.info("Ready for new session")
     }
 
     func hostSession() {
@@ -89,9 +96,17 @@ final class SessionCoordinator {
 
     func endSession() {
         Log.session.info("Ending session")
+        // Send endSession control frame and give it a moment to deliver
+        // before tearing down the transport. MCSession.disconnect() kills
+        // the DTLS connection immediately, so without this delay the
+        // reliable frame never reaches the peer.
         transport.sendControl(ControlFrame(message: .endSession))
-        tearDown()
-        sessionState = .ended
+        sessionState = .ending
+        Task {
+            try? await Task.sleep(for: .milliseconds(200))
+            tearDown()
+            sessionState = .ready
+        }
     }
 
     // MARK: - TX Control
@@ -169,6 +184,9 @@ final class SessionCoordinator {
     // MARK: - Handshake
 
     private func startHandshake() {
+        // Cancel any existing monitoring from a previous active phase (e.g., reconnection)
+        cancelMonitoring()
+
         let isHost = (role == .host)
         handshake = HandshakeManager(transport: transport, isHost: isHost)
         handshake?.start { [weak self] result in
@@ -186,7 +204,7 @@ final class SessionCoordinator {
         case .failure(let error):
             Log.session.error("Handshake failed: \(String(describing: error))")
             tearDown()
-            sessionState = .ended
+            sessionState = .ready
         }
     }
 
@@ -195,20 +213,23 @@ final class SessionCoordinator {
         metrics.markSessionStart()
 
         do {
-            // Audio session was pre-configured in requestPermissions().
-            // Re-configure here only as a safety net (idempotent).
+            // Configure audio session AFTER MC handshake is complete.
+            // Setting .voiceChat mode before MC connects interferes with AWDL radio.
             try routeManager.configureSession()
             routeState = routeManager.currentRoute
             try audioEngine.start()
         } catch {
             Log.session.error("Failed to start audio: \(error.localizedDescription)")
             tearDown()
-            sessionState = .ended
+            sessionState = .ready
             return
         }
 
         remoteControl.activate()
         applyTXMode()
+
+        // Recreate recovery stream for this session so the for-await loop starts fresh
+        recovery.recreateStream()
         startMonitoring()
 
         Log.session.info("Session active")
@@ -216,17 +237,28 @@ final class SessionCoordinator {
 
     // MARK: - Monitoring
 
+    private func cancelMonitoring() {
+        for task in monitorTasks { task.cancel() }
+        monitorTasks.removeAll()
+    }
+
     private func startMonitoring() {
+        // Cancel any previous monitors first to prevent accumulation
+        cancelMonitoring()
+
         // Monitor route changes
         monitorTasks.append(Task { [weak self] in
             guard let self else { return }
             for await route in self.routeManager.routeChanges {
+                guard !Task.isCancelled else { break }
                 self.routeState = route
                 self.recovery.handleRouteChange(route, speakerFallback: self.settings.speakerFallback)
-                self.transport.sendControl(ControlFrame(
-                    message: .routeChanged,
-                    payload: ["route": route.rawValue]
-                ))
+                if self.sessionState == .active {
+                    self.transport.sendControl(ControlFrame(
+                        message: .routeChanged,
+                        payload: ["route": route.rawValue]
+                    ))
+                }
             }
         })
 
@@ -234,6 +266,7 @@ final class SessionCoordinator {
         monitorTasks.append(Task { [weak self] in
             guard let self else { return }
             for await event in self.routeManager.interruptions {
+                guard !Task.isCancelled else { break }
                 self.recovery.handleInterruption(event)
             }
         })
@@ -242,6 +275,7 @@ final class SessionCoordinator {
         monitorTasks.append(Task { [weak self] in
             guard let self else { return }
             for await isVoice in self.vad.voiceActivity {
+                guard !Task.isCancelled else { break }
                 if self.settings.txMode == .voiceTX && self.sessionState == .active {
                     self.setTXState(isVoice ? .live : .armed)
                 }
@@ -252,6 +286,7 @@ final class SessionCoordinator {
         monitorTasks.append(Task { [weak self] in
             guard let self else { return }
             for await event in self.remoteControl.events {
+                guard !Task.isCancelled else { break }
                 if case .toggleTX = event {
                     self.toggleTX()
                 }
@@ -262,6 +297,7 @@ final class SessionCoordinator {
         monitorTasks.append(Task { [weak self] in
             guard let self else { return }
             for await action in self.recovery.actions {
+                guard !Task.isCancelled else { break }
                 self.handleRecoveryAction(action)
             }
         })
@@ -273,17 +309,20 @@ final class SessionCoordinator {
             sessionState = .reconnecting
             metrics.incrementReconnectCount()
 
-            // Only set up advertising/browsing on the first attempt.
-            // Subsequent recovery ticks should not recreateSession() —
-            // that kills any MC negotiation in flight.
-            guard !reconnectionAttempted else {
-                Log.session.info("Recovery: already advertising/browsing, waiting for connection")
-                return
+            // Stop audio on first attempt only
+            if !reconnectionAttempted {
+                audioEngine.stop()
             }
             reconnectionAttempted = true
 
-            audioEngine.stop()
+            // Always tear down and recreate the MC layer for each attempt.
+            // A failed MC connection leaves the session in a corrupted internal state
+            // ("Not in connected state, so giving up for participant..."), so we must
+            // start fresh each time.
+            transport.stopAdvertising()
+            transport.stopBrowsing()
             transport.recreateSession()
+
             if role == .host {
                 transport.startAdvertising()
                 Log.session.info("Recovery: re-advertising as host")
@@ -291,6 +330,16 @@ final class SessionCoordinator {
                 transport.setAutoInviteOnDiscover(true)
                 transport.startBrowsing()
                 Log.session.info("Recovery: re-browsing as guest (will auto-invite)")
+            }
+
+            // Set a timeout — if not reconnected in time, schedule next attempt
+            reconnectTimeoutTask?.cancel()
+            reconnectTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { return }
+                guard let self, self.sessionState == .reconnecting else { return }
+                Log.session.info("Recovery: reconnect attempt timed out, scheduling next")
+                self.recovery.scheduleReconnect()
             }
 
         case .routeDegraded(let route):
@@ -313,28 +362,32 @@ final class SessionCoordinator {
                 applyTXMode()
             } catch {
                 Log.session.error("Resume failed: \(error.localizedDescription)")
-                sessionState = .ended
+                tearDown()
+                sessionState = .ready
             }
 
         case .gaveUp:
             tearDown()
-            sessionState = .ended
+            sessionState = .ready
         }
     }
 
     // MARK: - Tear Down
 
     private func tearDown() {
-        for task in monitorTasks { task.cancel() }
-        monitorTasks.removeAll()
+        cancelMonitoring()
+        reconnectTimeoutTask?.cancel()
+        reconnectTimeoutTask = nil
 
         audioEngine.stop()
         remoteControl.deactivate()
         transport.stopAdvertising()
         transport.stopBrowsing()
         transport.disconnect()
+        transport.recreateSession()  // Ensure fresh MCSession for next use
         recovery.reset()
         handshake?.reset()
+        metrics.reset()
 
         txState = .disabled
         connectedPeerName = nil
@@ -352,7 +405,8 @@ extension SessionCoordinator: AudioEngineDelegate {
         // Send captured audio to the peer
         transport.sendAudio(header: header, payload: payload)
 
-        // Feed VAD
+        // Feed VAD with the original Float32 data via Int16→Float32 roundtrip.
+        // This is necessary since we only have the wire-encoded payload here.
         if let buffer = AudioFormatConverter.int16DataToFloat32(payload) {
             vad.process(buffer)
         }
@@ -386,6 +440,8 @@ extension SessionCoordinator: PeerTransportDelegate {
             self.transport.stopBrowsing()
             self.recovery.handleReconnectSucceeded()
             self.reconnectionAttempted = false
+            self.reconnectTimeoutTask?.cancel()
+            self.reconnectTimeoutTask = nil
             Log.session.info("Peer connected: \(peerID.displayName)")
             self.startHandshake()
         }
@@ -393,9 +449,32 @@ extension SessionCoordinator: PeerTransportDelegate {
 
     nonisolated func transport(_ transport: PeerTransport, peerDidDisconnect peerID: MCPeerID) {
         Task { @MainActor in
-            if self.sessionState == .active {
+            switch self.sessionState {
+            case .active, .interrupted, .routeFailed:
+                // Peer dropped during an active session — attempt recovery
                 self.recovery.handlePeerDisconnected()
                 self.sessionState = .reconnecting
+            case .connecting:
+                // Connection attempt failed (e.g., AWDL/DTLS race).
+                // Stay in .connecting and retry — recreate the MC session to clear
+                // stale DTLS state, then resume advertising/browsing. The peer is
+                // still there, so MC will rediscover it.
+                Log.session.warning("Connection attempt failed, retrying...")
+                self.handshake?.reset()
+                self.transport.recreateSession()
+                if self.role == .host {
+                    self.transport.startAdvertising()
+                } else {
+                    self.transport.startBrowsing()
+                }
+            case .reconnecting:
+                // Another disconnect during reconnection — will be retried by timeout
+                Log.session.warning("Peer disconnected during reconnection")
+            case .ending, .ended, .ready:
+                // We initiated the disconnect, or session is already over — ignore
+                break
+            default:
+                break
             }
         }
     }
@@ -418,7 +497,7 @@ extension SessionCoordinator {
         case .endSession:
             Log.session.info("Remote peer ended session")
             tearDown()
-            sessionState = .ended
+            sessionState = .ready
 
         case .ping:
             transport.sendControl(ControlFrame(message: .pong))

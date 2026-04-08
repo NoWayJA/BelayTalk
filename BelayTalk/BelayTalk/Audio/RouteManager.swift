@@ -1,5 +1,6 @@
 import AVFoundation
 import OSLog
+import os
 
 // MARK: - Protocol
 
@@ -15,13 +16,20 @@ nonisolated protocol RouteManaging: Sendable {
 nonisolated final class RouteManager: RouteManaging, @unchecked Sendable {
     private let session = AVAudioSession.sharedInstance()
 
-    private(set) var currentRoute: RouteState = .unavailable
+    private let lock = OSAllocatedUnfairLock<RouteState>(initialState: .unavailable)
+
+    var currentRoute: RouteState {
+        lock.withLock { $0 }
+    }
 
     private let routeContinuation: AsyncStream<RouteState>.Continuation
     let routeChanges: AsyncStream<RouteState>
 
     private let interruptionContinuation: AsyncStream<InterruptionEvent>.Continuation
     let interruptions: AsyncStream<InterruptionEvent>
+
+    private var routeObserver: (any NSObjectProtocol)?
+    private var interruptionObserver: (any NSObjectProtocol)?
 
     init() {
         var routeC: AsyncStream<RouteState>.Continuation!
@@ -38,7 +46,8 @@ nonisolated final class RouteManager: RouteManaging, @unchecked Sendable {
     deinit {
         routeContinuation.finish()
         interruptionContinuation.finish()
-        NotificationCenter.default.removeObserver(self)
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+        if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
     }
 
     func configureSession() throws {
@@ -52,8 +61,9 @@ nonisolated final class RouteManager: RouteManaging, @unchecked Sendable {
             Double(AudioConstants.frameDurationMs) / 1000.0
         )
         try session.setActive(true, options: .notifyOthersOnDeactivation)
-        currentRoute = detectRoute()
-        Log.route.info("Audio session configured, route: \(self.currentRoute.rawValue)")
+        let route = detectRoute()
+        lock.withLock { $0 = route }
+        Log.route.info("Audio session configured, route: \(route.rawValue)")
     }
 
     // MARK: - Route Detection
@@ -73,34 +83,40 @@ nonisolated final class RouteManager: RouteManaging, @unchecked Sendable {
         }
     }
 
-    // MARK: - Notification Observers
+    // MARK: - Notification Observers (block-based for safe deinit)
 
     private func observeNotifications() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleRouteChange),
-            name: AVAudioSession.routeChangeNotification,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleInterruption),
-            name: AVAudioSession.interruptionNotification,
-            object: nil
-        )
+        routeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.handleRouteChange()
+        }
+
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            self?.handleInterruption(notification)
+        }
     }
 
-    @objc private func handleRouteChange(_ notification: Notification) {
+    private func handleRouteChange() {
         let newRoute = detectRoute()
-        let oldRoute = currentRoute
-        currentRoute = newRoute
+        let oldRoute = lock.withLock { current -> RouteState in
+            let old = current
+            current = newRoute
+            return old
+        }
         if newRoute != oldRoute {
             Log.route.info("Route changed: \(oldRoute.rawValue) → \(newRoute.rawValue)")
             routeContinuation.yield(newRoute)
         }
     }
 
-    @objc private func handleInterruption(_ notification: Notification) {
+    private func handleInterruption(_ notification: Notification) {
         guard let userInfo = notification.userInfo,
               let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeValue)

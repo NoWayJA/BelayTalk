@@ -23,13 +23,14 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     private static let serviceType = "belaytalk"
 
     let localPeerID: MCPeerID
-    private var session: MCSession!
-    private var advertiser: MCNearbyServiceAdvertiser?
-    private var browser: MCNearbyServiceBrowser?
 
     private let lock = OSAllocatedUnfairLock<State>(initialState: State())
     private struct State {
+        var session: MCSession?
+        var advertiser: MCNearbyServiceAdvertiser?
+        var browser: MCNearbyServiceBrowser?
         var connectedPeer: MCPeerID?
+        var discoveredPeers: [MCPeerID] = []
         var isHosting = false
         var isBrowsing = false
         var autoInviteOnDiscover = false
@@ -40,7 +41,6 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     /// Discovered peers stream for the browser UI
     private let discoveredPeersContinuation: AsyncStream<[MCPeerID]>.Continuation
     let discoveredPeers: AsyncStream<[MCPeerID]>
-    private var _discoveredPeers: [MCPeerID] = []
 
     /// Notifies when a peer's invitation was auto-accepted (for UI feedback)
     private let autoAcceptedPeerContinuation: AsyncStream<MCPeerID>.Continuation
@@ -60,18 +60,21 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
 
         super.init()
 
-        session = MCSession(
+        let newSession = MCSession(
             peer: localPeerID,
             securityIdentity: nil,
             encryptionPreference: .optional
         )
-        session.delegate = self
+        newSession.delegate = self
+        lock.withLock { $0.session = newSession }
     }
 
     deinit {
-        stopAdvertising()
-        stopBrowsing()
-        session.disconnect()
+        lock.withLock { state in
+            state.advertiser?.stopAdvertisingPeer()
+            state.browser?.stopBrowsingForPeers()
+            state.session?.disconnect()
+        }
         discoveredPeersContinuation.finish()
         autoAcceptedPeerContinuation.finish()
     }
@@ -79,6 +82,11 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     // MARK: - Host (Advertise)
 
     @MainActor func startAdvertising() {
+        // Stop any existing advertiser first
+        lock.withLock { state in
+            state.advertiser?.stopAdvertisingPeer()
+        }
+
         let adv = MCNearbyServiceAdvertiser(
             peer: localPeerID,
             discoveryInfo: nil,
@@ -86,41 +94,63 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
         )
         adv.delegate = self
         adv.startAdvertisingPeer()
-        advertiser = adv
-        lock.withLock { $0.isHosting = true }
+        lock.withLock { state in
+            state.advertiser = adv
+            state.isHosting = true
+        }
         Log.transport.info("Started advertising")
     }
 
     func stopAdvertising() {
-        advertiser?.stopAdvertisingPeer()
-        advertiser = nil
-        lock.withLock { $0.isHosting = false }
+        lock.withLock { state in
+            state.advertiser?.stopAdvertisingPeer()
+            state.advertiser = nil
+            state.isHosting = false
+        }
     }
 
     // MARK: - Join (Browse)
 
     @MainActor func startBrowsing() {
+        // Stop any existing browser and clear stale discovered peers.
+        // Stale MCPeerID objects carry internal DTLS state from previous
+        // sessions — inviting them to a new MCSession causes "Not in
+        // connected state" failures.
+        lock.withLock { state in
+            state.browser?.stopBrowsingForPeers()
+            state.discoveredPeers.removeAll()
+        }
+        discoveredPeersContinuation.yield([])
+
         let br = MCNearbyServiceBrowser(
             peer: localPeerID,
             serviceType: Self.serviceType
         )
         br.delegate = self
         br.startBrowsingForPeers()
-        browser = br
-        lock.withLock { $0.isBrowsing = true }
+        lock.withLock { state in
+            state.browser = br
+            state.isBrowsing = true
+        }
         Log.transport.info("Started browsing")
     }
 
     func stopBrowsing() {
-        browser?.stopBrowsingForPeers()
-        browser = nil
-        _discoveredPeers.removeAll()
-        lock.withLock { $0.isBrowsing = false }
+        lock.withLock { state in
+            state.browser?.stopBrowsingForPeers()
+            state.browser = nil
+            state.discoveredPeers.removeAll()
+            state.isBrowsing = false
+        }
+        discoveredPeersContinuation.yield([])
     }
 
     /// Invite a discovered peer to join
     func invite(peer: MCPeerID) {
-        browser?.invitePeer(peer, to: session, withContext: nil, timeout: 30)
+        lock.withLock { state in
+            guard let browser = state.browser, let session = state.session else { return }
+            browser.invitePeer(peer, to: session, withContext: nil, timeout: 30)
+        }
         Log.transport.info("Invited peer: \(peer.displayName)")
     }
 
@@ -132,13 +162,15 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     // MARK: - Send
 
     func sendAudio(header: AudioFrameHeader, payload: Data) {
-        guard let peer = lock.withLock({ $0.connectedPeer }) else { return }
+        let (peer, session) = lock.withLock { ($0.connectedPeer, $0.session) }
+        guard let peer, let session else { return }
         let data = FrameSerializer.encodeAudioFrame(header: header, payload: payload)
         try? session.send(data, toPeers: [peer], with: .unreliable)
     }
 
     func sendControl(_ frame: ControlFrame) {
-        guard let peer = lock.withLock({ $0.connectedPeer }) else { return }
+        let (peer, session) = lock.withLock { ($0.connectedPeer, $0.session) }
+        guard let peer, let session else { return }
         guard let data = FrameSerializer.encodeControlFrame(frame) else { return }
         do {
             try session.send(data, toPeers: [peer], with: .reliable)
@@ -150,23 +182,28 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     // MARK: - Disconnect
 
     func disconnect() {
-        session.disconnect()
-        lock.withLock { $0.connectedPeer = nil }
+        lock.withLock { state in
+            state.session?.disconnect()
+            state.connectedPeer = nil
+        }
         Log.transport.info("Disconnected")
     }
 
     /// Recreate the internal MCSession for clean reconnection.
     /// A disconnected MCSession may be in a terminal state and unable to accept new connections.
     @MainActor func recreateSession() {
-        session.disconnect()
-        session = MCSession(
-            peer: localPeerID,
-            securityIdentity: nil,
-            encryptionPreference: .optional
-        )
-        session.delegate = self
-        lock.withLock { $0.connectedPeer = nil }
-        Log.transport.info("MCSession recreated for reconnection")
+        lock.withLock { state in
+            state.session?.disconnect()
+            let newSession = MCSession(
+                peer: localPeerID,
+                securityIdentity: nil,
+                encryptionPreference: .optional
+            )
+            newSession.delegate = self
+            state.session = newSession
+            state.connectedPeer = nil
+        }
+        Log.transport.info("MCSession recreated")
     }
 
     var connectedPeerName: String? {
@@ -203,6 +240,9 @@ extension PeerTransport: MCSessionDelegate {
                 delegate?.transport(self, peerDidDisconnect: peerID)
             } else {
                 Log.transport.warning("Peer connection attempt failed: \(peerID.displayName)")
+                // Also notify delegate — a failed connection attempt during .connecting
+                // needs to be handled by the coordinator
+                delegate?.transport(self, peerDidDisconnect: peerID)
             }
 
         case .connecting:
@@ -243,8 +283,10 @@ extension PeerTransport: MCNearbyServiceAdvertiserDelegate {
         withContext context: Data?,
         invitationHandler: @escaping (Bool, MCSession?) -> Void
     ) {
+        let (alreadyConnected, session) = lock.withLock { ($0.connectedPeer != nil, $0.session) }
+
         // Reject if already connected (single peer enforced)
-        if lock.withLock({ $0.connectedPeer }) != nil {
+        if alreadyConnected {
             Log.transport.warning("Rejected invitation from \(peerID.displayName) — already connected")
             invitationHandler(false, nil)
             return
@@ -271,8 +313,11 @@ extension PeerTransport: MCNearbyServiceBrowserDelegate {
         foundPeer peerID: MCPeerID,
         withDiscoveryInfo info: [String: String]?
     ) {
-        _discoveredPeers.append(peerID)
-        discoveredPeersContinuation.yield(_discoveredPeers)
+        let peers = lock.withLock { state -> [MCPeerID] in
+            state.discoveredPeers.append(peerID)
+            return state.discoveredPeers
+        }
+        discoveredPeersContinuation.yield(peers)
         Log.transport.info("Found peer: \(peerID.displayName)")
 
         let shouldAutoInvite = lock.withLock { state in
@@ -289,8 +334,11 @@ extension PeerTransport: MCNearbyServiceBrowserDelegate {
     }
 
     nonisolated func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
-        _discoveredPeers.removeAll { $0 == peerID }
-        discoveredPeersContinuation.yield(_discoveredPeers)
+        let peers = lock.withLock { state -> [MCPeerID] in
+            state.discoveredPeers.removeAll { $0 == peerID }
+            return state.discoveredPeers
+        }
+        discoveredPeersContinuation.yield(peers)
         Log.transport.info("Lost peer: \(peerID.displayName)")
     }
 
