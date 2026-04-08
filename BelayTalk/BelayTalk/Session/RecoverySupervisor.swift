@@ -17,7 +17,7 @@ nonisolated final class RecoverySupervisor: @unchecked Sendable {
     }
 
     enum RecoveryAction: Sendable {
-        case reconnect
+        case reconnect(attempt: Int)
         case routeDegraded(RouteState)
         case routeFailed
         case interrupted
@@ -31,6 +31,10 @@ nonisolated final class RecoverySupervisor: @unchecked Sendable {
         var config = Configuration()
         var currentAttempt = 0
         var reconnectTask: Task<Void, Never>?
+    }
+
+    var maxAttempts: Int {
+        lock.withLock { $0.config.maxAttempts }
     }
 
     /// Each call creates a fresh stream — safe for multiple session lifetimes.
@@ -109,7 +113,7 @@ nonisolated final class RecoverySupervisor: @unchecked Sendable {
         let task = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
-            self?.yieldAction(.reconnect)
+            self?.yieldAction(.reconnect(attempt: attempt))
         }
         lock.withLock { $0.reconnectTask = task }
     }

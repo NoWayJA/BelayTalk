@@ -24,6 +24,19 @@ nonisolated final class AudioEngine: @unchecked Sendable {
     /// Maximum number of buffers queued on the player node to prevent unbounded latency.
     private static let maxScheduledBuffers = 4
 
+    /// Pre-allocated silence buffer for background keep-alive.
+    /// iOS suspends background audio apps that stop producing output,
+    /// so we schedule this when the jitter buffer is empty.
+    private let silenceBuffer: AVAudioPCMBuffer? = {
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: AudioConstants.processingFormat,
+            frameCapacity: AVAudioFrameCount(AudioConstants.samplesPerFrame)
+        ) else { return nil }
+        buffer.frameLength = buffer.frameCapacity
+        // Buffer is zero-filled by default — silence
+        return buffer
+    }()
+
     private let lock = OSAllocatedUnfairLock<State>(initialState: State())
     private struct State {
         var sequenceNumber: UInt32 = 0
@@ -194,16 +207,21 @@ nonisolated final class AudioEngine: @unchecked Sendable {
         let currentCount = lock.withLock { $0.scheduledBufferCount }
         guard currentCount < Self.maxScheduledBuffers else { return }
 
-        if let wireData = jitterBuffer.pull() {
-            // Convert Int16 wire data → Float32 for playback
-            if let playBuffer = AudioFormatConverter.int16DataToFloat32(wireData) {
-                lock.withLock { $0.scheduledBufferCount += 1 }
-                playerNode.scheduleBuffer(playBuffer) { [weak self] in
-                    self?.lock.withLock { $0.scheduledBufferCount -= 1 }
-                }
-            }
+        let playBuffer: AVAudioPCMBuffer
+        if let wireData = jitterBuffer.pull(),
+           let decoded = AudioFormatConverter.int16DataToFloat32(wireData) {
+            playBuffer = decoded
+        } else {
+            // Schedule silence to keep the audio pipeline active.
+            // iOS requires continuous audio output for background execution —
+            // without this, the system suspends the app when the screen locks.
+            guard let silence = silenceBuffer else { return }
+            playBuffer = silence
         }
-        // No silence fill — just skip the cycle if no data.
-        // The player node stays running and will play the next buffer when available.
+
+        lock.withLock { $0.scheduledBufferCount += 1 }
+        playerNode.scheduleBuffer(playBuffer) { [weak self] in
+            self?.lock.withLock { $0.scheduledBufferCount -= 1 }
+        }
     }
 }

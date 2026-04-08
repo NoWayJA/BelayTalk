@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 // MARK: - VAD Sensitivity
 
@@ -68,6 +69,10 @@ nonisolated enum WindRejection: String, Codable, CaseIterable, Sendable {
 final class AppSettings {
     private let defaults = UserDefaults.standard
 
+    var displayName: String {
+        didSet { defaults.set(displayName, forKey: Keys.displayName) }
+    }
+
     var txMode: TXMode {
         didSet { defaults.set(txMode.rawValue, forKey: Keys.txMode) }
     }
@@ -92,21 +97,29 @@ final class AppSettings {
         didSet { defaults.set(speakerFallback, forKey: Keys.speakerFallback) }
     }
 
+    var preventAutoLock: Bool {
+        didSet { defaults.set(preventAutoLock, forKey: Keys.preventAutoLock) }
+    }
+
     init() {
+        displayName = defaults.string(forKey: Keys.displayName) ?? UIDevice.current.name
         txMode = TXMode(rawValue: defaults.string(forKey: Keys.txMode) ?? "") ?? .voiceTX
         vadSensitivity = VADSensitivity(rawValue: defaults.string(forKey: Keys.vadSensitivity) ?? "") ?? .normal
         hangTime = HangTime(rawValue: defaults.integer(forKey: Keys.hangTime)) ?? .medium
         windRejection = WindRejection(rawValue: defaults.string(forKey: Keys.windRejection) ?? "") ?? .off
         autoResume = defaults.object(forKey: Keys.autoResume) as? Bool ?? true
-        speakerFallback = defaults.object(forKey: Keys.speakerFallback) as? Bool ?? false
+        speakerFallback = defaults.object(forKey: Keys.speakerFallback) as? Bool ?? true
+        preventAutoLock = defaults.object(forKey: Keys.preventAutoLock) as? Bool ?? false
     }
 
     private enum Keys {
+        static let displayName = "displayName"
         static let txMode = "txMode"
         static let vadSensitivity = "vadSensitivity"
         static let hangTime = "hangTime"
         static let windRejection = "windRejection"
         static let autoResume = "autoResume"
         static let speakerFallback = "speakerFallback"
+        static let preventAutoLock = "preventAutoLock"
     }
 }

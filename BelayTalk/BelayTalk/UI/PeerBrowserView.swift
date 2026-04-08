@@ -33,6 +33,13 @@ struct PeerBrowserView: View {
             }
         }
         .navigationTitle("Available Sessions")
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") {
+                    coordinator.cancelConnecting()
+                }
+            }
+        }
         .task {
             for await discovered in coordinator.transport.discoveredPeers {
                 peers = discovered

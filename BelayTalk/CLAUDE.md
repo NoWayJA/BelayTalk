@@ -62,6 +62,9 @@ BelayTalk/BelayTalk/
 - Jitter buffer: 60ms default, adaptive 40-120ms
 - Handshake: HELLO → HELLO_ACK → CAPS → READY → START
 - Recovery: exponential backoff 0.5s → 5s cap, 10 max attempts
+- Background audio keep-alive: silence buffers scheduled when jitter buffer is empty — iOS requires continuous audio output to keep app alive during screen lock
+- Scene phase monitoring in BelayTalkApp for background/foreground lifecycle handling
+- Display name changes take effect immediately (MCPeerID + MCSession recreated)
 
 ## Permissions (Info.plist)
 

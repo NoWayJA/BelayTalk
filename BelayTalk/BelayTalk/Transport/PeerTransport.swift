@@ -22,7 +22,7 @@ nonisolated protocol PeerTransportDelegate: AnyObject, Sendable {
 nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     private static let serviceType = "belaytalk"
 
-    let localPeerID: MCPeerID
+    private(set) var localPeerID: MCPeerID
 
     private let lock = OSAllocatedUnfairLock<State>(initialState: State())
     private struct State {
@@ -46,8 +46,7 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     private let autoAcceptedPeerContinuation: AsyncStream<MCPeerID>.Continuation
     let autoAcceptedPeers: AsyncStream<MCPeerID>
 
-    @MainActor override init() {
-        let displayName = UIDevice.current.name
+    @MainActor init(displayName: String) {
         localPeerID = MCPeerID(displayName: displayName)
 
         var dpC: AsyncStream<[MCPeerID]>.Continuation!
@@ -77,6 +76,13 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
         }
         discoveredPeersContinuation.finish()
         autoAcceptedPeerContinuation.finish()
+    }
+
+    /// Update the local peer's display name. Only safe when not connected.
+    @MainActor func updateDisplayName(_ name: String) {
+        localPeerID = MCPeerID(displayName: name)
+        recreateSession()
+        Log.transport.info("Display name updated to \(name)")
     }
 
     // MARK: - Host (Advertise)

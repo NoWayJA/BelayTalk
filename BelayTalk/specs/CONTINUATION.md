@@ -58,6 +58,9 @@ BelayTalk/BelayTalk/
 12. **Three TX modes**: Open Mic (continuous), Voice TX (VAD-gated, default), Manual TX (user-toggled)
 13. **Handshake**: HELLO → HELLO_ACK → CAPS → READY → START
 14. **Recovery**: Exponential backoff reconnect (0.5s → 5s cap, 10 max attempts)
+15. **Background audio keep-alive**: AudioEngine schedules silence buffers when jitter buffer is empty — iOS requires continuous audio output to keep background audio apps alive during screen lock
+16. **Scene phase monitoring**: BelayTalkApp observes scenePhase to handle background/foreground transitions and re-activate audio session after interruption
+17. **Display name updates**: PeerTransport.updateDisplayName() recreates MCPeerID + MCSession — takes effect immediately without app restart (only when not in a session)
 
 ---
 

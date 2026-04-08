@@ -8,6 +8,14 @@ struct SettingsView: View {
         @Bindable var settings = coordinator.settings
 
         Form {
+            Section("Name Your Phone") {
+                TextField("Phone name", text: $settings.displayName)
+                    .textContentType(.name)
+                    .onSubmit {
+                        coordinator.updateDisplayName(settings.displayName)
+                    }
+            }
+
             Section("Transmit Mode") {
                 Picker("Mode", selection: $settings.txMode) {
                     ForEach(TXMode.allCases, id: \.self) { mode in
@@ -44,6 +52,10 @@ struct SettingsView: View {
             Section("Session") {
                 Toggle("Auto Resume", isOn: $settings.autoResume)
                 Toggle("Speaker Fallback", isOn: $settings.speakerFallback)
+                Toggle("Prevent Auto-Lock", isOn: $settings.preventAutoLock)
+            }
+            .onChange(of: settings.preventAutoLock) { _, _ in
+                coordinator.updateIdleTimer()
             }
         }
         .navigationTitle("Settings")

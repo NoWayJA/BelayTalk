@@ -208,6 +208,8 @@ mode: .voiceChat
 
 * Continue in lock screen
 * Requires audio background mode
+* Silence buffer keep-alive: AudioEngine schedules zero-filled buffers when no peer audio is available, ensuring iOS keeps the app alive during screen lock
+* Scene phase monitoring: app detects background/foreground transitions and re-activates audio session if interrupted while backgrounded
 
 ---
 
@@ -476,6 +478,7 @@ Persistence/
 * Hang time: 500ms
 * Auto resume: On
 * Speaker fallback: Off
+* Prevent auto-lock: Off
 
 ---
 

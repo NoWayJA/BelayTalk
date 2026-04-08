@@ -1,6 +1,7 @@
 import AVFoundation
 import MultipeerConnectivity
 import OSLog
+import UIKit
 
 /// Top-level orchestrator that owns all modules and manages the session lifecycle.
 ///
@@ -15,18 +16,20 @@ final class SessionCoordinator {
     private(set) var routeState: RouteState = .unavailable
     private(set) var connectedPeerName: String?
     private(set) var role: ConnectionRole?
+    /// Current reconnection attempt number (0 = not reconnecting). Observable for UI.
+    private(set) var reconnectAttempt: Int = 0
 
     let metrics = SessionMetrics()
     let settings = AppSettings()
 
     // MARK: - Modules
 
-    let transport = PeerTransport()
+    let transport: PeerTransport
     private let audioEngine = AudioEngine()
     private let routeManager = RouteManager()
     private let vad = VoiceActivityDetector()
     private let remoteControl = RemoteControlHandler()
-    private let recovery = RecoverySupervisor()
+    let recovery = RecoverySupervisor()
     private var handshake: HandshakeManager?
 
     // MARK: - Task Management
@@ -35,8 +38,17 @@ final class SessionCoordinator {
     private var reconnectionAttempted = false
     /// Timeout task for reconnection — if peer doesn't reconnect in time, schedule next attempt.
     private var reconnectTimeoutTask: Task<Void, Never>?
+    /// Timeout task for the initial connection attempt.
+    private var connectTimeoutTask: Task<Void, Never>?
+    /// Number of connection retries during the initial .connecting phase.
+    private var connectRetryCount = 0
+    /// Maximum retries during initial connection before giving up.
+    private static let maxConnectRetries = 3
+    /// How long to wait for the initial connection before timing out.
+    private static let connectTimeoutSeconds: TimeInterval = 30
 
     init() {
+        transport = PeerTransport(displayName: settings.displayName)
         audioEngine.delegate = self
         transport.delegate = self
         vad.updateSettings(
@@ -77,21 +89,61 @@ final class SessionCoordinator {
     func hostSession() {
         guard sessionState == .ready else { return }
         role = .host
+        connectRetryCount = 0
         sessionState = .connecting
         transport.startAdvertising()
+        startConnectTimeout()
         Log.session.info("Hosting session — auto-accepting connections")
     }
 
     func joinSession() {
         guard sessionState == .ready else { return }
         role = .guest
+        connectRetryCount = 0
         sessionState = .connecting
         transport.startBrowsing()
+        startConnectTimeout()
         Log.session.info("Joining session — browsing for peers")
     }
 
     func invitePeer(_ peerID: MCPeerID) {
         transport.invite(peer: peerID)
+    }
+
+    /// Cancel a connection attempt (before session is active). No control frame needed.
+    func cancelConnecting() {
+        guard sessionState == .connecting else { return }
+        Log.session.info("Connection attempt cancelled")
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
+        transport.stopAdvertising()
+        transport.stopBrowsing()
+        transport.disconnect()
+        transport.recreateSession()
+        handshake?.reset()
+        connectedPeerName = nil
+        role = nil
+        connectRetryCount = 0
+        sessionState = .ready
+    }
+
+    private func startConnectTimeout() {
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.connectTimeoutSeconds))
+            guard !Task.isCancelled else { return }
+            guard let self, self.sessionState == .connecting else { return }
+            Log.session.warning("Connection timed out after \(Self.connectTimeoutSeconds)s")
+            self.cancelConnecting()
+        }
+    }
+
+    /// User manually gives up on reconnection.
+    func giveUpReconnecting() {
+        guard sessionState == .reconnecting else { return }
+        Log.session.info("User gave up reconnecting")
+        tearDown()
+        sessionState = .ready
     }
 
     func endSession() {
@@ -149,6 +201,14 @@ final class SessionCoordinator {
         ))
     }
 
+    /// Apply a display name change to the transport layer.
+    /// Only takes effect when not in an active session.
+    func updateDisplayName(_ name: String) {
+        guard sessionState == .idle || sessionState == .ready ||
+              sessionState == .permissions || sessionState == .ended else { return }
+        transport.updateDisplayName(name)
+    }
+
     func updateVADSettings() {
         vad.updateSettings(
             sensitivity: settings.vadSensitivity,
@@ -179,6 +239,44 @@ final class SessionCoordinator {
         case .manualTX:
             setTXState(.armed)
         }
+    }
+
+    // MARK: - App Lifecycle
+
+    /// Call when the app enters the background (screen lock, home button, etc.)
+    func handleDidEnterBackground() {
+        guard sessionState == .active || sessionState == .reconnecting else { return }
+        Log.session.info("App entered background — audio session stays active")
+        // Audio session + engine continue running via background audio entitlement.
+        // The silence buffer in AudioEngine keeps iOS from suspending us.
+    }
+
+    /// Call when the app returns to the foreground.
+    func handleWillEnterForeground() {
+        guard sessionState == .active || sessionState == .reconnecting ||
+              sessionState == .interrupted else { return }
+        Log.session.info("App entering foreground")
+
+        // Re-activate the audio session in case iOS deactivated it while backgrounded.
+        // This handles edge cases like Siri or phone calls interrupting audio.
+        if sessionState == .interrupted {
+            do {
+                try routeManager.configureSession()
+                try audioEngine.start()
+                sessionState = .active
+                applyTXMode()
+                Log.session.info("Audio resumed after foreground return")
+            } catch {
+                Log.session.error("Failed to resume audio on foreground: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Keeps the screen on during an active session when the user has opted in.
+    func updateIdleTimer() {
+        let inSession = (sessionState == .active || sessionState == .reconnecting ||
+                         sessionState == .interrupted || sessionState == .connecting)
+        UIApplication.shared.isIdleTimerDisabled = settings.preventAutoLock && inSession
     }
 
     // MARK: - Handshake
@@ -305,14 +403,10 @@ final class SessionCoordinator {
 
     private func handleRecoveryAction(_ action: RecoverySupervisor.RecoveryAction) {
         switch action {
-        case .reconnect:
+        case .reconnect(let attempt):
             sessionState = .reconnecting
+            reconnectAttempt = attempt
             metrics.incrementReconnectCount()
-
-            // Stop audio on first attempt only
-            if !reconnectionAttempted {
-                audioEngine.stop()
-            }
             reconnectionAttempted = true
 
             // Always tear down and recreate the MC layer for each attempt.
@@ -376,6 +470,8 @@ final class SessionCoordinator {
 
     private func tearDown() {
         cancelMonitoring()
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
         reconnectTimeoutTask?.cancel()
         reconnectTimeoutTask = nil
 
@@ -393,6 +489,9 @@ final class SessionCoordinator {
         connectedPeerName = nil
         role = nil
         reconnectionAttempted = false
+        reconnectAttempt = 0
+        connectRetryCount = 0
+        UIApplication.shared.isIdleTimerDisabled = false
 
         Log.session.info("Session torn down")
     }
@@ -435,6 +534,9 @@ extension SessionCoordinator: PeerTransportDelegate {
 
     nonisolated func transport(_ transport: PeerTransport, peerDidConnect peerID: MCPeerID) {
         Task { @MainActor in
+            self.connectTimeoutTask?.cancel()
+            self.connectTimeoutTask = nil
+            self.reconnectAttempt = 0
             self.connectedPeerName = peerID.displayName
             self.transport.stopAdvertising()
             self.transport.stopBrowsing()
@@ -451,21 +553,33 @@ extension SessionCoordinator: PeerTransportDelegate {
         Task { @MainActor in
             switch self.sessionState {
             case .active, .interrupted, .routeFailed:
+                // Stop audio IMMEDIATELY to prevent DTLS error flood.
+                // The MCSession is dead — sending into it produces thousands of
+                // "Failed to send DTLS packet" errors until the delegate fires.
+                self.audioEngine.stop()
                 // Peer dropped during an active session — attempt recovery
                 self.recovery.handlePeerDisconnected()
                 self.sessionState = .reconnecting
             case .connecting:
                 // Connection attempt failed (e.g., AWDL/DTLS race).
-                // Stay in .connecting and retry — recreate the MC session to clear
-                // stale DTLS state, then resume advertising/browsing. The peer is
-                // still there, so MC will rediscover it.
-                Log.session.warning("Connection attempt failed, retrying...")
-                self.handshake?.reset()
-                self.transport.recreateSession()
-                if self.role == .host {
-                    self.transport.startAdvertising()
+                self.connectRetryCount += 1
+                if self.connectRetryCount >= Self.maxConnectRetries {
+                    Log.session.error("Connection failed after \(self.connectRetryCount) retries — giving up")
+                    self.cancelConnecting()
                 } else {
-                    self.transport.startBrowsing()
+                    // Stay in .connecting and retry with a short delay to let MC settle.
+                    Log.session.warning("Connection attempt failed (\(self.connectRetryCount)/\(Self.maxConnectRetries)), retrying in 1s...")
+                    self.handshake?.reset()
+                    self.transport.recreateSession()
+                    Task {
+                        try? await Task.sleep(for: .seconds(1))
+                        guard self.sessionState == .connecting else { return }
+                        if self.role == .host {
+                            self.transport.startAdvertising()
+                        } else {
+                            self.transport.startBrowsing()
+                        }
+                    }
                 }
             case .reconnecting:
                 // Another disconnect during reconnection — will be retried by timeout

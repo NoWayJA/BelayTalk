@@ -10,6 +10,7 @@ import SwiftUI
 @main
 struct BelayTalkApp: App {
     @State private var coordinator = SessionCoordinator()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -34,6 +35,21 @@ struct BelayTalkApp: App {
             .environment(coordinator)
             .animation(.default, value: coordinator.sessionState)
         }
+        .onChange(of: scenePhase) { _, newPhase in
+            switch newPhase {
+            case .background:
+                coordinator.handleDidEnterBackground()
+            case .active:
+                coordinator.handleWillEnterForeground()
+            case .inactive:
+                break
+            @unknown default:
+                break
+            }
+        }
+        .onChange(of: coordinator.sessionState) {
+            coordinator.updateIdleTimer()
+        }
     }
 
     private var waitingView: some View {
@@ -46,7 +62,7 @@ struct BelayTalkApp: App {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             Button("Cancel") {
-                coordinator.endSession()
+                coordinator.cancelConnecting()
             }
             .padding(.top)
         }

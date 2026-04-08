@@ -60,3 +60,15 @@
 ## Final
 - [x] Full clean build with zero warnings
 - [ ] Preview verification on key views
+
+## Post-v1: Field Testing Fixes
+
+### Background Audio / Screen Lock Survival
+- [x] AudioEngine: silence buffer keep-alive — schedule zero-filled buffers when jitter buffer is empty so iOS never suspends the app during screen lock
+- [x] BelayTalkApp: scene phase monitoring — detect background/foreground transitions, re-activate audio session on foreground return if interrupted
+- [x] SessionCoordinator: app lifecycle handlers — `handleDidEnterBackground()`, `handleWillEnterForeground()`, `updateIdleTimer()`
+
+### Settings Improvements
+- [x] Add `preventAutoLock` setting (default: off) — optionally keeps screen awake during sessions
+- [x] Display name live update — changing name in settings now takes effect immediately without app restart (recreates MCPeerID + MCSession)
+- [x] PeerTransport: `updateDisplayName(_:)` method — recreates peer identity when not in a session

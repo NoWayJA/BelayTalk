@@ -20,8 +20,26 @@ struct SessionView: View {
 
             Spacer()
 
-            // Central TX state indicator
-            TXStateIndicator(txState: coordinator.txState)
+            if coordinator.sessionState == .reconnecting {
+                // Reconnection overlay
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.large)
+                    Text("Reconnecting...")
+                        .font(.title3.weight(.semibold))
+                    Text("Attempt \(coordinator.reconnectAttempt) of \(coordinator.recovery.maxAttempts)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Button("Give Up") {
+                        coordinator.giveUpReconnecting()
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 8)
+                }
+            } else {
+                // Central TX state indicator
+                TXStateIndicator(txState: coordinator.txState)
+            }
 
             Spacer()
 
@@ -36,11 +54,13 @@ struct SessionView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .disabled(coordinator.sessionState != .active)
 
             // TX button (primarily for manual mode, but useful for mute in other modes)
             TXButton(txState: coordinator.txState) {
                 coordinator.toggleTX()
             }
+            .disabled(coordinator.sessionState != .active)
 
             // End session
             Button(role: .destructive) {
