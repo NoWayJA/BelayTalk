@@ -4,15 +4,15 @@ import os
 
 /// Monitors transport disconnection, route changes, and interruptions.
 ///
-/// - Auto-reconnect with exponential backoff (0.5s → 5s cap, 10 max attempts)
+/// - Auto-reconnect with exponential backoff (3s → 10s cap, 5 max attempts)
 /// - Route degradation: BT→speaker = warn, →unavailable = pause
 /// - Interruption pause/resume respecting `shouldResume`
 nonisolated final class RecoverySupervisor: @unchecked Sendable {
 
     struct Configuration: Sendable {
-        var initialDelay: TimeInterval = 0.5
-        var maxDelay: TimeInterval = 5.0
-        var maxAttempts: Int = 10
+        var initialDelay: TimeInterval = 3.0
+        var maxDelay: TimeInterval = 10.0
+        var maxAttempts: Int = 5
         var autoResume: Bool = true
     }
 

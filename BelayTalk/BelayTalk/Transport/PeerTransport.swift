@@ -213,6 +213,28 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
         Log.transport.info("MCSession recreated")
     }
 
+    /// Recreate both MCPeerID and MCSession to clear all stale DTLS state.
+    /// The MC daemon maps DTLS participant state to the MCPeerID's internal
+    /// identifier. Reusing the same MCPeerID after a failed connection inherits
+    /// poisoned DTLS context ("Not in connected state" errors). A fresh MCPeerID
+    /// generates a new participant UUID, forcing a clean DTLS handshake.
+    @MainActor func recreateSessionWithFreshPeerID() {
+        let displayName = localPeerID.displayName
+        localPeerID = MCPeerID(displayName: displayName)
+        lock.withLock { state in
+            state.session?.disconnect()
+            let newSession = MCSession(
+                peer: localPeerID,
+                securityIdentity: nil,
+                encryptionPreference: .optional
+            )
+            newSession.delegate = self
+            state.session = newSession
+            state.connectedPeer = nil
+        }
+        Log.transport.info("MCPeerID + MCSession recreated (fresh DTLS identity)")
+    }
+
     var connectedPeerName: String? {
         lock.withLock { $0.connectedPeer?.displayName }
     }

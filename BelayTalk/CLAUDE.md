@@ -64,8 +64,10 @@ BelayTalk/BelayTalk/
 - Jitter buffer: 40ms default (2 frames), adaptive 40-120ms
 - Max scheduled playback buffers: 2 (40ms max playback queue)
 - Handshake: HELLO → HELLO_ACK → CAPS → READY → START
-- Recovery: exponential backoff 0.5s → 5s cap, 10 max attempts
-- Audio startup grace period: 3s window after audio activation where MC disconnects are ignored (expected due to BT HFP/AWDL conflict)
+- Recovery: exponential backoff 3s → 10s cap, 5 max attempts
+- Two-phase audio activation: Phase 1 starts on built-in speaker (no BT HFP → AWDL stays clean). Phase 2 upgrades to BT HFP after 3s MC stability check, with 10s grace period for the A2DP→HFP switch.
+- Fresh MCPeerID on connection failure: `recreateSessionWithFreshPeerID()` clears stale DTLS state that causes "Not in connected state" errors
+- Asymmetric retry timing: guest retries fast (0.5-1s), host retries slower (2-3s) to break DTLS race conditions
 - Audio session deactivation: `tearDown()` deactivates AVAudioSession to free AWDL radio for subsequent MC discovery
 - Connection status messages: `connectionStatusMessage` observable property updated at each lifecycle stage for UI feedback
 - MC failure surfacing: advertiser/browser failures reported via `didFailToStartWithError` delegate method
@@ -75,7 +77,7 @@ BelayTalk/BelayTalk/
 
 ## Known Issues
 
-- Audio takes 5-6 recovery attempts to stabilize after initial MC connection (BT HFP negotiation disrupts AWDL radio). See `specs/AUDIO_CONNECTION_DEBUG.md` for analysis and proposed fix.
+- BT HFP negotiation briefly disrupts AWDL radio. Mitigated by two-phase audio activation (speaker first, BT upgrade after MC stabilizes). See `specs/AUDIO_CONNECTION_DEBUG.md` for full analysis.
 
 ## Permissions (Info.plist)
 

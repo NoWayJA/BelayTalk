@@ -9,6 +9,8 @@ nonisolated protocol RouteManaging: Sendable {
     var routeChanges: AsyncStream<RouteState> { get }
     var interruptions: AsyncStream<InterruptionEvent> { get }
     func configureSession() throws
+    func configureSessionWithoutBluetooth() throws
+    func upgradeToBluetoothHFP() throws
     func deactivateSession()
 }
 
@@ -65,6 +67,40 @@ nonisolated final class RouteManager: RouteManaging, @unchecked Sendable {
         let route = detectRoute()
         lock.withLock { $0 = route }
         Log.route.info("Audio session configured, route: \(route.rawValue)")
+    }
+
+    /// Phase 1 audio configuration: voice processing WITHOUT Bluetooth HFP.
+    /// Routes audio to the built-in speaker/mic to avoid A2DP→HFP switch
+    /// that disrupts the AWDL radio MultipeerConnectivity uses.
+    /// Echo cancellation still works via AudioEngine's setVoiceProcessingEnabled(true).
+    func configureSessionWithoutBluetooth() throws {
+        try session.setCategory(
+            .playAndRecord,
+            mode: .voiceChat,
+            options: [.defaultToSpeaker]  // NO .allowBluetoothHFP
+        )
+        try session.setPreferredSampleRate(AudioConstants.sampleRate)
+        try session.setPreferredIOBufferDuration(
+            Double(AudioConstants.frameDurationMs) / 1000.0
+        )
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
+        let route = detectRoute()
+        lock.withLock { $0 = route }
+        Log.route.info("Audio session configured (no BT), route: \(route.rawValue)")
+    }
+
+    /// Phase 2: Upgrade to Bluetooth HFP after MC connection is stable.
+    /// Only changes the category options — mode stays .voiceChat so voice
+    /// processing continues uninterrupted. This triggers A2DP→HFP switch.
+    func upgradeToBluetoothHFP() throws {
+        try session.setCategory(
+            .playAndRecord,
+            mode: .voiceChat,
+            options: [.allowBluetoothHFP, .defaultToSpeaker]
+        )
+        let route = detectRoute()
+        lock.withLock { $0 = route }
+        Log.route.info("Audio session upgraded to BT HFP, route: \(route.rawValue)")
     }
 
     func deactivateSession() {

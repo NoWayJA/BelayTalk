@@ -45,7 +45,7 @@ final class SessionCoordinator {
     /// Number of connection retries during the initial .connecting phase.
     private var connectRetryCount = 0
     /// Maximum retries during initial connection before giving up.
-    private static let maxConnectRetries = 3
+    private static let maxConnectRetries = 5
     /// How long to wait for the initial connection before timing out.
     private static let connectTimeoutSeconds: TimeInterval = 30
     /// Grace period: during the first few seconds after audio startup,
@@ -96,7 +96,7 @@ final class SessionCoordinator {
     /// Prepare coordinator for a new session (reset state from .ended to .ready).
     func prepareForNewSession() {
         guard sessionState == .ended else { return }
-        transport.recreateSession()
+        transport.recreateSessionWithFreshPeerID()
         metrics.reset()
         sessionState = .ready
         Log.session.info("Ready for new session")
@@ -146,7 +146,7 @@ final class SessionCoordinator {
         transport.stopAdvertising()
         transport.stopBrowsing()
         transport.disconnect()
-        transport.recreateSession()
+        transport.recreateSessionWithFreshPeerID()
         routeManager.deactivateSession()
         handshake?.reset()
         connectedPeerName = nil
@@ -358,40 +358,15 @@ final class SessionCoordinator {
             sessionStartTime = .now
         }
 
-        // Start the audio startup grace period BEFORE configuring audio.
-        // BT HFP negotiation during .voiceChat mode setup disrupts AWDL,
-        // causing MC disconnects. These are transient and expected.
-        isInAudioStartupGrace = true
-        audioStartupGraceTask?.cancel()
-        audioStartupGraceTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(8))
-            guard !Task.isCancelled else { return }
-            guard let self else { return }
-            self.isInAudioStartupGrace = false
-            self.audioStartupGraceTask = nil
-            Log.session.info("[\(self.elapsed)] Audio startup grace period ended")
-            // If we disconnected during grace and never reconnected, trigger recovery now.
-            // Stop audio and deactivate session to free the AWDL radio for MC recovery.
-            if !self.transport.isConnected && self.sessionState == .active {
-                Log.session.warning("[\(self.elapsed)] Still disconnected after grace period — triggering recovery")
-                self.audioEngine.stop()
-                self.routeManager.deactivateSession()
-                self.recovery.handlePeerDisconnected()
-                self.sessionState = .reconnecting
-            }
-        }
-
+        // Phase 1: Start audio on built-in speaker WITHOUT Bluetooth HFP.
+        // This avoids the A2DP→HFP switch that disrupts AWDL. MC stays connected.
+        // Echo cancellation still works via AudioEngine's setVoiceProcessingEnabled(true).
         do {
-            // Configure audio session AFTER MC handshake is complete.
-            // Setting .voiceChat mode before MC connects interferes with AWDL radio.
-            try routeManager.configureSession()
+            try routeManager.configureSessionWithoutBluetooth()
             routeState = routeManager.currentRoute
             try audioEngine.start()
         } catch {
             Log.session.error("Failed to start audio: \(error.localizedDescription)")
-            isInAudioStartupGrace = false
-            audioStartupGraceTask?.cancel()
-            audioStartupGraceTask = nil
             tearDown()
             sessionState = .ready
             return
@@ -404,8 +379,67 @@ final class SessionCoordinator {
         recovery.recreateStream()
         startMonitoring()
 
-        connectionStatusMessage = "Active"
-        Log.session.info("[\(self.elapsed)] Session active — audio running")
+        connectionStatusMessage = "Active (connecting headset…)"
+        Log.session.info("[\(self.elapsed)] Session active — audio on speaker, scheduling BT upgrade")
+
+        // Phase 2: After MC is confirmed stable, upgrade to Bluetooth HFP.
+        scheduleBTUpgrade()
+    }
+
+    /// Task for the deferred Bluetooth HFP upgrade.
+    private var btUpgradeTask: Task<Void, Never>?
+
+    /// Schedule the Bluetooth HFP upgrade after a stability delay.
+    /// Waits for MC to be stable for 3 seconds, then activates .allowBluetoothHFP.
+    /// A grace period absorbs the brief MC disruption from the A2DP→HFP switch.
+    private func scheduleBTUpgrade() {
+        btUpgradeTask?.cancel()
+        btUpgradeTask = Task { [weak self] in
+            // Wait for MC to stabilize before triggering HFP switch.
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            guard let self, self.sessionState == .active else { return }
+
+            // Verify MC is still connected before triggering HFP switch
+            guard self.transport.isConnected else {
+                Log.session.warning("[\(self.elapsed)] MC disconnected before BT upgrade — skipping")
+                return
+            }
+
+            // Enable grace period BEFORE the upgrade. The HFP switch will likely
+            // cause a brief MC blip as it disrupts AWDL.
+            self.isInAudioStartupGrace = true
+            self.audioStartupGraceTask?.cancel()
+            self.audioStartupGraceTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { return }
+                guard let self else { return }
+                self.isInAudioStartupGrace = false
+                self.audioStartupGraceTask = nil
+                Log.session.info("[\(self.elapsed)] BT upgrade grace period ended")
+                if !self.transport.isConnected && self.sessionState == .active {
+                    Log.session.warning("[\(self.elapsed)] Still disconnected after BT upgrade grace — triggering recovery")
+                    self.audioEngine.stop()
+                    self.routeManager.deactivateSession()
+                    self.recovery.handlePeerDisconnected()
+                    self.sessionState = .reconnecting
+                }
+            }
+
+            do {
+                try self.routeManager.upgradeToBluetoothHFP()
+                self.routeState = self.routeManager.currentRoute
+                self.connectionStatusMessage = "Active"
+                Log.session.info("[\(self.elapsed)] BT HFP upgrade complete")
+            } catch {
+                // BT upgrade failed — audio continues on built-in speaker (non-fatal)
+                Log.session.error("[\(self.elapsed)] BT upgrade failed: \(error.localizedDescription)")
+                self.connectionStatusMessage = "Active (speaker)"
+                self.isInAudioStartupGrace = false
+                self.audioStartupGraceTask?.cancel()
+                self.audioStartupGraceTask = nil
+            }
+        }
     }
 
     // MARK: - Monitoring
@@ -492,7 +526,7 @@ final class SessionCoordinator {
             // start fresh each time.
             transport.stopAdvertising()
             transport.stopBrowsing()
-            transport.recreateSession()
+            transport.recreateSessionWithFreshPeerID()
 
             if role == .host {
                 transport.startAdvertising()
@@ -557,6 +591,8 @@ final class SessionCoordinator {
         audioStartupGraceTask?.cancel()
         audioStartupGraceTask = nil
         isInAudioStartupGrace = false
+        btUpgradeTask?.cancel()
+        btUpgradeTask = nil
 
         audioEngine.stop()
         routeManager.deactivateSession()
@@ -565,7 +601,7 @@ final class SessionCoordinator {
         transport.stopAdvertising()
         transport.stopBrowsing()
         transport.disconnect()
-        transport.recreateSession()  // Ensure fresh MCSession for next use
+        transport.recreateSessionWithFreshPeerID()
         recovery.reset()
         handshake?.reset()
         metrics.reset()
@@ -670,15 +706,18 @@ extension SessionCoordinator: PeerTransportDelegate {
                     Log.session.error("Connection failed after \(self.connectRetryCount) retries — giving up")
                     self.cancelConnecting()
                 } else {
-                    // Stay in .connecting and retry with a short delay to let MC settle.
-                    // Add random jitter (0-500ms) to break symmetry when both sides
-                    // retry simultaneously, causing DTLS race conditions.
-                    let jitterMs = Int.random(in: 0...500)
-                    let delayMs = 1000 + jitterMs
+                    // Asymmetric retry timing: the guest (active, sends invitations) retries
+                    // fast, while the host (passive, advertises) waits longer. This breaks
+                    // DTLS race conditions where both sides retry simultaneously.
+                    let delayMs: Int = if self.role == .host {
+                        2000 + Int.random(in: 0...1000)   // Host: 2-3s
+                    } else {
+                        500 + Int.random(in: 0...500)      // Guest: 0.5-1s
+                    }
                     self.connectionStatusMessage = "Connection dropped — retrying (\(self.connectRetryCount)/\(Self.maxConnectRetries))…"
                     Log.session.warning("Connection attempt failed (\(self.connectRetryCount)/\(Self.maxConnectRetries)), retrying in \(delayMs)ms...")
                     self.handshake?.reset()
-                    self.transport.recreateSession()
+                    self.transport.recreateSessionWithFreshPeerID()
                     Task {
                         try? await Task.sleep(for: .milliseconds(delayMs))
                         guard self.sessionState == .connecting else { return }
