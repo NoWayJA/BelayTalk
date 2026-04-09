@@ -1,31 +1,39 @@
 # BelayTalk — Continuation Prompt
 
-Use this document to resume implementation in a fresh context. Read this file, then read `specs/PLAN.md` and `specs/TODO.md`, then continue building from wherever TODO.md left off.
+Use this document to resume work in a fresh context.
 
 ---
 
 ## What Is BelayTalk
 
-A production-quality, offline, peer-to-peer voice intercom iOS app for rock climbing. Two iPhones + Bluetooth headsets create a persistent, hands-free audio channel between climber and belayer. **Lives may depend on reliability** — this is not a toy.
+A production-quality, offline, peer-to-peer voice intercom iOS app for rock climbing. Two iPhones + Bluetooth headsets create a persistent, hands-free audio channel between climber and belayer. **Lives may depend on reliability.**
 
 Read `specs/overview.md` for product vision and `specs/Feature_Stories.md` for the full technical specification.
 
 ---
 
-## Project Setup
+## Current State
 
-- **Xcode project**: SwiftUI app, file-system synchronized groups (just create files on disk / via XcodeWrite — Xcode picks them up automatically)
-- **Deployment target**: iOS 26.4 (latest)
-- **Swift concurrency**: `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, `SWIFT_APPROACHABLE_CONCURRENCY = YES`
-- **No external dependencies** — all Apple system frameworks (AVFAudio, MultipeerConnectivity, MediaPlayer, OSLog)
-- **Info.plist**: Auto-generated from build settings + explicit `BelayTalk/Info.plist` for Bonjour/background audio
-- **Permissions configured**: Microphone, Local Network, Background Audio, Bonjour `_belaytalk._tcp`
+The app is **fully built and functional**. All 6 build phases are complete (31 files). It connects, handshakes, and streams audio between two iPhones with Bluetooth headsets. Background audio works during screen lock.
+
+### Recent Improvements (April 2025)
+- **Audio session deactivation** — `RouteManager.deactivateSession()` frees AWDL radio between sessions
+- **Frame chunking** — Variable hardware buffers chunked into proper 320-sample (20ms) frames
+- **Reduced buffering** — Jitter depth 3→2 frames (40ms), playback cap 4→2 buffers
+- **Audio startup grace period** — 3s window where MC disconnects are ignored during BT HFP negotiation
+- **Connection status UI** — `connectionStatusMessage` shows live status at every lifecycle stage
+- **"Connecting audio"** language — User-friendly status during audio reconnection
+- **MC failure surfacing** — Advertiser/browser failures reported via delegate
+- **VAD reset** — Cleared on session start and teardown
+
+### Known Issue
+Audio still takes **5-6 recovery attempts** to stabilize after initial MC connection. This is due to the BT HFP/AWDL radio conflict. See `specs/AUDIO_CONNECTION_DEBUG.md` for full analysis, hypotheses, and the recommended fix approach.
 
 ---
 
 ## Architecture
 
-9 modules, built bottom-up:
+9 modules:
 
 ```
 BelayTalk/BelayTalk/
@@ -45,57 +53,33 @@ BelayTalk/BelayTalk/
 ## Key Technical Decisions
 
 1. **`@Observable` + `@Environment`** for UI state (not Combine, not `@Published`)
-2. **`@unchecked Sendable`** with `OSAllocatedUnfairLock` for audio-thread classes (actors too slow for RT audio)
+2. **`@unchecked Sendable`** with `OSAllocatedUnfairLock` for audio-thread classes
 3. **AsyncStream** for event delivery (route changes, VAD, remote control, interruptions)
-4. **Binary serialization** for audio frames (1B type + 19B header + PCM payload), JSON for control frames
-5. **Audio**: 16kHz mono, 20ms frames (320 samples), PCM Int16 on wire, Float32 for processing
-6. **`MCSessionSendDataMode.unreliable`** for audio, `.reliable` for control messages
-7. **`isVoiceProcessingInputMuted`** for TX gating (keeps pipeline warm, preserves echo cancellation state)
-8. **`setVoiceProcessingEnabled(true)`** on input node for echo cancellation + noise reduction
-9. **Jitter buffer**: 60ms default (3 frames), adaptive 40-120ms, drop late packets, silence fill for missing
-10. **Session state machine**: Idle → Permissions → Ready → Connecting → Active → Reconnecting → Interrupted → RouteFailed → Ended
-11. **TX states**: Disabled, Armed, Live, HoldOpen, Muted
-12. **Three TX modes**: Open Mic (continuous), Voice TX (VAD-gated, default), Manual TX (user-toggled)
-13. **Handshake**: HELLO → HELLO_ACK → CAPS → READY → START
-14. **Recovery**: Exponential backoff reconnect (0.5s → 5s cap, 10 max attempts)
-15. **Background audio keep-alive**: AudioEngine schedules silence buffers when jitter buffer is empty — iOS requires continuous audio output to keep background audio apps alive during screen lock
-16. **Scene phase monitoring**: BelayTalkApp observes scenePhase to handle background/foreground transitions and re-activate audio session after interruption
-17. **Display name updates**: PeerTransport.updateDisplayName() recreates MCPeerID + MCSession — takes effect immediately without app restart (only when not in a session)
+4. **Audio**: 16kHz mono, 20ms frames (320 samples), PCM Int16 on wire, Float32 for processing
+5. **Frame chunking**: Hardware delivers variable buffers; AudioEngine chunks to 320-sample frames with residual carry
+6. **`MCSessionSendDataMode.unreliable`** for audio, `.reliable` for control
+7. **Jitter buffer**: 40ms default (2 frames), adaptive 40-120ms
+8. **Handshake**: HELLO → HELLO_ACK → CAPS → READY → START
+9. **Recovery**: Exponential backoff 0.5s → 5s cap, 10 max attempts
+10. **Audio startup grace**: 3s window ignoring MC disconnects during BT HFP negotiation
+11. **Audio session deactivation**: `tearDown()` deactivates AVAudioSession to free AWDL radio
+12. **Connection status**: `connectionStatusMessage` observable property updated at each lifecycle stage
 
 ---
 
-## Build Order
+## Build & Run
 
-Phases must be built in order (each depends on the previous):
-
-1. **Phase 1**: Foundation types + diagnostics + persistence (6 files)
-2. **Phase 2**: Audio infrastructure — RouteManager, AudioEngine, VAD (7 files)
-3. **Phase 3**: Transport — PeerTransport, FrameSerializer, Handshake (3 files)
-4. **Phase 4**: Remote control + recovery supervisor (2 files)
-5. **Phase 5**: Session coordinator (1 file — the composition root)
-6. **Phase 6**: UI layer — all views and components (13 files + modify BelayTalkApp.swift + delete ContentView.swift)
-
-**Build after each phase** to catch errors early.
-
----
-
-## Code Style
-
-- PascalCase for types, camelCase for properties/methods
-- 4-space indentation
-- `let` over `var` where possible
-- Protocols for testability (`RouteManaging`, `VoiceActivityDetecting`, `RemoteControlHandling`)
-- OSLog via `Log.session`, `Log.transport`, `Log.audio`, etc.
-- No Combine — use async/await and AsyncStream
-- Production quality: defensive error handling, clear logging, graceful degradation
+- **Xcode project**: `BelayTalk.xcodeproj`
+- **Deployment target**: iOS 26.4
+- **No external dependencies** — all Apple system frameworks
+- **Concurrency**: `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, `SWIFT_APPROACHABLE_CONCURRENCY = YES`
 
 ---
 
 ## How To Continue
 
 1. Read this file (done)
-2. Read `specs/PLAN.md` for detailed file-by-file descriptions
-3. Read `specs/TODO.md` to see what's completed and what's next
-4. Pick up from the first unchecked item in TODO.md
-5. After completing each file, update TODO.md to check it off
-6. Build after completing each phase
+2. Read `CLAUDE.md` for code style and conventions
+3. Check `specs/TODO.md` for outstanding items
+4. For the audio connection retry issue, read `specs/AUDIO_CONNECTION_DEBUG.md`
+5. Read the relevant source files before making changes

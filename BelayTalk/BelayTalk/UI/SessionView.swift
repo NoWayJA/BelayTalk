@@ -26,7 +26,7 @@ struct SessionView: View {
                     ProgressView()
                         .controlSize(.large)
                     Text(coordinator.connectionStatusMessage.isEmpty
-                         ? "Reconnecting…"
+                         ? "Connecting audio…"
                          : coordinator.connectionStatusMessage)
                         .font(.title3.weight(.semibold))
                     Text("Attempt \(coordinator.reconnectAttempt) of \(coordinator.recovery.maxAttempts)")

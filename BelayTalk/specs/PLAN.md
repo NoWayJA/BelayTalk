@@ -1,10 +1,10 @@
 # BelayTalk — Full Implementation Plan
 
+> **Status: COMPLETE** — All 6 build phases finished. This document is retained as an architecture reference. See `TODO.md` for post-v1 field testing fixes and outstanding items.
+
 ## Context
 
 BelayTalk is a production-quality, offline, peer-to-peer voice intercom for rock climbing. Two iPhones with Bluetooth headsets create a persistent, hands-free audio channel between climber and belayer. No internet, no accounts, no servers. Although not a safety device, **lives may depend on its reliability** — so every module must be robust, well-tested, and recoverable.
-
-The project is a fresh Xcode SwiftUI template. We're building the entire app bottom-up across 6 phases.
 
 ---
 

@@ -25,7 +25,7 @@ struct ConnectionStatusBadge: View {
         case .ready: "Ready"
         case .connecting: "Connecting…"
         case .active: "Connected"
-        case .reconnecting: "Reconnecting…"
+        case .reconnecting: "Connecting Audio…"
         case .interrupted: "Interrupted"
         case .routeFailed: "Route Failed"
         case .ending: "Ending…"

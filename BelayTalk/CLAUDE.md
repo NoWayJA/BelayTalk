@@ -8,9 +8,10 @@ BelayTalk is a production-quality, offline, peer-to-peer voice intercom iOS app 
 
 - `specs/overview.md` — Product vision and problem statement
 - `specs/Feature_Stories.md` — Full technical specification
-- `specs/PLAN.md` — File-by-file implementation plan
+- `specs/PLAN.md` — Original file-by-file build plan (all phases complete)
 - `specs/TODO.md` — Implementation progress checklist
 - `specs/CONTINUATION.md` — Quick-start context for resuming work
+- `specs/AUDIO_CONNECTION_DEBUG.md` — Debugging guide for the audio connection retry issue
 
 ## Build & Run
 
@@ -56,15 +57,25 @@ BelayTalk/BelayTalk/
 
 ## Key Technical Decisions
 
-- Audio: 16kHz mono, 20ms frames, PCM Int16 on wire, Float32 for processing
+- Audio: 16kHz mono, 20ms frames (320 samples), PCM Int16 on wire, Float32 for processing
+- Frame chunking: hardware delivers variable-size buffers (1024-4096 samples at 48kHz); after rate conversion to 16kHz, AudioEngine chunks into proper 320-sample frames with residual buffering between callbacks
 - `MCSessionSendDataMode.unreliable` for audio, `.reliable` for control
 - TX muting via `isVoiceProcessingInputMuted` (keeps echo cancellation state)
-- Jitter buffer: 60ms default, adaptive 40-120ms
+- Jitter buffer: 40ms default (2 frames), adaptive 40-120ms
+- Max scheduled playback buffers: 2 (40ms max playback queue)
 - Handshake: HELLO → HELLO_ACK → CAPS → READY → START
 - Recovery: exponential backoff 0.5s → 5s cap, 10 max attempts
+- Audio startup grace period: 3s window after audio activation where MC disconnects are ignored (expected due to BT HFP/AWDL conflict)
+- Audio session deactivation: `tearDown()` deactivates AVAudioSession to free AWDL radio for subsequent MC discovery
+- Connection status messages: `connectionStatusMessage` observable property updated at each lifecycle stage for UI feedback
+- MC failure surfacing: advertiser/browser failures reported via `didFailToStartWithError` delegate method
 - Background audio keep-alive: silence buffers scheduled when jitter buffer is empty — iOS requires continuous audio output to keep app alive during screen lock
 - Scene phase monitoring in BelayTalkApp for background/foreground lifecycle handling
 - Display name changes take effect immediately (MCPeerID + MCSession recreated)
+
+## Known Issues
+
+- Audio takes 5-6 recovery attempts to stabilize after initial MC connection (BT HFP negotiation disrupts AWDL radio). See `specs/AUDIO_CONNECTION_DEBUG.md` for analysis and proposed fix.
 
 ## Permissions (Info.plist)
 

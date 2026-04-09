@@ -59,7 +59,6 @@
 
 ## Final
 - [x] Full clean build with zero warnings
-- [ ] Preview verification on key views
 
 ## Post-v1: Field Testing Fixes
 
@@ -72,3 +71,21 @@
 - [x] Add `preventAutoLock` setting (default: off) — optionally keeps screen awake during sessions
 - [x] Display name live update — changing name in settings now takes effect immediately without app restart (recreates MCPeerID + MCSession)
 - [x] PeerTransport: `updateDisplayName(_:)` method — recreates peer identity when not in a session
+### Connection Reliability & Latency (Code Review Fixes)
+- [x] Audio session deactivation: `RouteManager.deactivateSession()` called in `tearDown()` and `cancelConnecting()` to free AWDL radio for subsequent MC discovery
+- [x] Frame chunking: AudioEngine now chunks variable-size hardware buffers into proper 320-sample (20ms) frames with residual buffering between callbacks
+- [x] Direct Float32→Int16 conversion: `float32ChunkToInt16Data()` helper avoids AVAudioPCMBuffer allocation on audio thread
+- [x] Reduced jitter buffer depth: 3 frames (60ms) → 2 frames (40ms)
+- [x] Reduced max scheduled playback buffers: 4 → 2 (40ms max playback queue)
+- [x] Audio startup grace period: 3-second window in `beginActiveSession()` where MC disconnects are ignored (BT HFP/AWDL conflict expected)
+- [x] Connection status messages: `connectionStatusMessage` observable property on SessionCoordinator, updated at each lifecycle stage
+- [x] UI status integration: BelayTalkApp, PeerBrowserView, SessionView all display live connection status
+- [x] "Reconnecting" → "Connecting audio" language across all UI surfaces
+- [x] VAD reset: `vad.reset()` called in `beginActiveSession()` and `tearDown()`
+- [x] MC failure surfacing: `didFailToStartWithError` added to PeerTransportDelegate, fired from advertiser/browser failure callbacks
+- [x] Handshake CAPS skip warning: log warning when READY arrives before CAPS
+
+### Outstanding
+- [ ] Audio connection retry issue: still takes 5-6 recovery attempts before audio stabilizes (see `specs/AUDIO_CONNECTION_DEBUG.md`)
+- [ ] Preview verification on key views
+

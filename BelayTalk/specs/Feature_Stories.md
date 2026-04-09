@@ -291,7 +291,7 @@ payload
 
 ### Jitter Buffer
 
-* Default: 60 ms
+* Default: 40 ms (2 frames)
 * Adaptive: 40–120 ms
 
 ---
