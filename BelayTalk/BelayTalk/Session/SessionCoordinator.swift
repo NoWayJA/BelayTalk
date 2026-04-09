@@ -52,6 +52,16 @@ final class SessionCoordinator {
     /// MC disconnects are expected (BT HFP negotiation disrupts AWDL).
     private var isInAudioStartupGrace = false
     private var audioStartupGraceTask: Task<Void, Never>?
+    /// Tracks when the current session started (first beginActiveSession call) for elapsed-time logging.
+    private var sessionStartTime: ContinuousClock.Instant?
+
+    /// Formatted elapsed time since session start, for diagnostic logs.
+    private var elapsed: String {
+        guard let start = sessionStartTime else { return "+?s" }
+        let ms = (ContinuousClock.now - start).components.seconds * 1000
+            + Int64((ContinuousClock.now - start).components.attoseconds / 1_000_000_000_000_000)
+        return "+\(String(format: "%.1f", Double(ms) / 1000.0))s"
+    }
 
     init() {
         transport = PeerTransport(displayName: settings.displayName)
@@ -135,6 +145,7 @@ final class SessionCoordinator {
         role = nil
         connectRetryCount = 0
         connectionStatusMessage = ""
+        sessionStartTime = nil
         sessionState = .ready
     }
 
@@ -308,11 +319,11 @@ final class SessionCoordinator {
     private func handleHandshakeResult(_ result: Result<Capabilities, HandshakeManager.HandshakeError>) {
         switch result {
         case .success(let caps):
-            Log.session.info("Handshake complete: protocol v\(caps.protocolVersion)")
+            Log.session.info("[\(self.elapsed)] Handshake complete: protocol v\(caps.protocolVersion)")
             if sessionState == .active && audioEngine.isRunning {
                 // Grace-period reconnect — audio already running, just resume.
                 // Skip beginActiveSession() to avoid restarting BT HFP negotiation.
-                Log.session.info("Handshake succeeded on existing active session (grace reconnect)")
+                Log.session.info("[\(self.elapsed)] Handshake succeeded on existing active session (grace reconnect)")
             } else {
                 beginActiveSession()
             }
@@ -333,6 +344,11 @@ final class SessionCoordinator {
         connectionStatusMessage = "Starting audio…"
         metrics.markSessionStart()
         vad.reset()
+        // Track session start time for elapsed-time diagnostics.
+        // Only set on first call — recovery calls beginActiveSession() again.
+        if sessionStartTime == nil {
+            sessionStartTime = .now
+        }
 
         // Start the audio startup grace period BEFORE configuring audio.
         // BT HFP negotiation during .voiceChat mode setup disrupts AWDL,
@@ -340,16 +356,16 @@ final class SessionCoordinator {
         isInAudioStartupGrace = true
         audioStartupGraceTask?.cancel()
         audioStartupGraceTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(8))
+            try? await Task.sleep(for: .seconds(5))
             guard !Task.isCancelled else { return }
             guard let self else { return }
             self.isInAudioStartupGrace = false
             self.audioStartupGraceTask = nil
-            Log.session.info("Audio startup grace period ended")
+            Log.session.info("[\(self.elapsed)] Audio startup grace period ended")
             // If we disconnected during grace and never reconnected, trigger recovery now.
             // Stop audio and deactivate session to free the AWDL radio for MC recovery.
             if !self.transport.isConnected && self.sessionState == .active {
-                Log.session.warning("Still disconnected after grace period — triggering recovery")
+                Log.session.warning("[\(self.elapsed)] Still disconnected after grace period — triggering recovery")
                 self.audioEngine.stop()
                 self.routeManager.deactivateSession()
                 self.recovery.handlePeerDisconnected()
@@ -381,7 +397,7 @@ final class SessionCoordinator {
         startMonitoring()
 
         connectionStatusMessage = "Active"
-        Log.session.info("Session active")
+        Log.session.info("[\(self.elapsed)] Session active — audio running")
     }
 
     // MARK: - Monitoring
@@ -458,6 +474,7 @@ final class SessionCoordinator {
             sessionState = .reconnecting
             reconnectAttempt = attempt
             connectionStatusMessage = "Connecting audio (attempt \(attempt))…"
+            Log.session.info("[\(self.elapsed)] Recovery: starting attempt \(attempt)")
             metrics.incrementReconnectCount()
             reconnectionAttempted = true
 
@@ -478,13 +495,16 @@ final class SessionCoordinator {
                 Log.session.info("Recovery: re-browsing as guest (will auto-invite)")
             }
 
-            // Set a timeout — if not reconnected in time, schedule next attempt
+            // Set a timeout — if not reconnected in time, schedule next attempt.
+            // MC needs 15-20s for AWDL to fully stabilize after BT HFP release.
+            // A shorter timeout (e.g. 10s) kills in-flight connections that would
+            // have succeeded, wasting recovery attempts.
             reconnectTimeoutTask?.cancel()
             reconnectTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(10))
+                try? await Task.sleep(for: .seconds(20))
                 guard !Task.isCancelled else { return }
                 guard let self, self.sessionState == .reconnecting else { return }
-                Log.session.info("Recovery: reconnect attempt timed out, scheduling next")
+                Log.session.warning("Recovery: attempt \(attempt) timed out after 20s, scheduling next")
                 self.recovery.scheduleReconnect()
             }
 
@@ -607,10 +627,10 @@ extension SessionCoordinator: PeerTransportDelegate {
                 // Reconnected during grace — audio is already running.
                 // Just re-handshake on the new MC connection.
                 self.connectionStatusMessage = "Connecting audio…"
-                Log.session.info("Peer reconnected during audio startup grace — re-handshaking")
+                Log.session.info("[\(self.elapsed)] Peer reconnected during audio startup grace — re-handshaking")
             } else {
                 self.connectionStatusMessage = "Connected — handshaking…"
-                Log.session.info("Peer connected: \(peerID.displayName)")
+                Log.session.info("[\(self.elapsed)] Peer connected: \(peerID.displayName)")
             }
             self.startHandshake()
         }
@@ -623,12 +643,13 @@ extension SessionCoordinator: PeerTransportDelegate {
                 if self.isInAudioStartupGrace {
                     // During audio startup, MC disconnects are expected due to
                     // BT HFP negotiation disrupting AWDL. Don't stop audio or trigger recovery.
-                    Log.session.info("Disconnect during audio startup grace — ignoring (BT/AWDL expected)")
+                    Log.session.info("[\(self.elapsed)] Disconnect during audio startup grace — ignoring (BT/AWDL expected)")
                     return
                 }
                 // Stop audio and deactivate the audio session to free the AWDL radio.
                 // BT HFP mode continuously degrades AWDL — MC can't reconnect while
                 // audio is running. Deactivating gives recovery a clean radio window.
+                Log.session.warning("[\(self.elapsed)] Peer disconnected post-grace — stopping audio for recovery")
                 self.audioEngine.stop()
                 self.routeManager.deactivateSession()
                 // Peer dropped during an active session — attempt recovery
