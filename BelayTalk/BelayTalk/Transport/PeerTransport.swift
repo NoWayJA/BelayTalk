@@ -70,11 +70,23 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     }
 
     deinit {
-        lock.withLock { state in
-            state.advertiser?.stopAdvertisingPeer()
-            state.browser?.stopBrowsingForPeers()
-            state.session?.disconnect()
+        // Extract MC objects and nil delegates before stopping.
+        // This prevents re-entrant lock attempts from synchronous callbacks.
+        let (adv, br, sess) = lock.withLock { state -> (MCNearbyServiceAdvertiser?, MCNearbyServiceBrowser?, MCSession?) in
+            let a = state.advertiser
+            let b = state.browser
+            let s = state.session
+            state.advertiser = nil
+            state.browser = nil
+            state.session = nil
+            return (a, b, s)
         }
+        adv?.delegate = nil
+        adv?.stopAdvertisingPeer()
+        br?.delegate = nil
+        br?.stopBrowsingForPeers()
+        sess?.delegate = nil
+        sess?.disconnect()
         discoveredPeersContinuation.finish()
         autoAcceptedPeerContinuation.finish()
     }
@@ -89,10 +101,15 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     // MARK: - Host (Advertise)
 
     @MainActor func startAdvertising() {
-        // Stop any existing advertiser first
-        lock.withLock { state in
-            state.advertiser?.stopAdvertisingPeer()
+        // Extract old advertiser from lock, nil delegate, stop OUTSIDE lock
+        // to prevent re-entrant lock from synchronous MC callbacks.
+        let oldAdv = lock.withLock { state -> MCNearbyServiceAdvertiser? in
+            let old = state.advertiser
+            state.advertiser = nil
+            return old
         }
+        oldAdv?.delegate = nil
+        oldAdv?.stopAdvertisingPeer()
 
         let adv = MCNearbyServiceAdvertiser(
             peer: localPeerID,
@@ -109,24 +126,29 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     }
 
     func stopAdvertising() {
-        lock.withLock { state in
-            state.advertiser?.stopAdvertisingPeer()
+        let oldAdv = lock.withLock { state -> MCNearbyServiceAdvertiser? in
+            let old = state.advertiser
             state.advertiser = nil
             state.isHosting = false
+            return old
         }
+        oldAdv?.delegate = nil
+        oldAdv?.stopAdvertisingPeer()
     }
 
     // MARK: - Join (Browse)
 
     @MainActor func startBrowsing() {
-        // Stop any existing browser and clear stale discovered peers.
-        // Stale MCPeerID objects carry internal DTLS state from previous
-        // sessions — inviting them to a new MCSession causes "Not in
-        // connected state" failures.
-        lock.withLock { state in
-            state.browser?.stopBrowsingForPeers()
+        // Extract old browser from lock, nil delegate, stop OUTSIDE lock
+        // to prevent re-entrant lock from synchronous MC callbacks.
+        let oldBr = lock.withLock { state -> MCNearbyServiceBrowser? in
+            let old = state.browser
+            state.browser = nil
             state.discoveredPeers.removeAll()
+            return old
         }
+        oldBr?.delegate = nil
+        oldBr?.stopBrowsingForPeers()
         discoveredPeersContinuation.yield([])
 
         let br = MCNearbyServiceBrowser(
@@ -143,12 +165,15 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     }
 
     func stopBrowsing() {
-        lock.withLock { state in
-            state.browser?.stopBrowsingForPeers()
+        let oldBr = lock.withLock { state -> MCNearbyServiceBrowser? in
+            let old = state.browser
             state.browser = nil
             state.discoveredPeers.removeAll()
             state.isBrowsing = false
+            return old
         }
+        oldBr?.delegate = nil
+        oldBr?.stopBrowsingForPeers()
         discoveredPeersContinuation.yield([])
     }
 
@@ -189,27 +214,39 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     // MARK: - Disconnect
 
     func disconnect() {
-        lock.withLock { state in
-            state.session?.disconnect()
+        // Extract session, nil delegate, disconnect OUTSIDE lock.
+        let oldSession = lock.withLock { state -> MCSession? in
+            let old = state.session
             state.connectedPeer = nil
+            return old
         }
+        oldSession?.delegate = nil
+        oldSession?.disconnect()
         Log.transport.info("Disconnected")
     }
 
     /// Recreate the internal MCSession for clean reconnection.
     /// A disconnected MCSession may be in a terminal state and unable to accept new connections.
     @MainActor func recreateSession() {
-        lock.withLock { state in
-            state.session?.disconnect()
-            let newSession = MCSession(
-                peer: localPeerID,
-                securityIdentity: nil,
-                encryptionPreference: .optional
-            )
-            newSession.delegate = self
-            state.session = newSession
+        // Extract old session FIRST, then create new one.
+        // Nil delegate + disconnect OUTSIDE the lock to prevent re-entrant
+        // lock from synchronous MC callbacks (OSAllocatedUnfairLock is non-reentrant).
+        let oldSession = lock.withLock { state -> MCSession? in
+            let old = state.session
+            state.session = nil
             state.connectedPeer = nil
+            return old
         }
+        oldSession?.delegate = nil
+        oldSession?.disconnect()
+
+        let newSession = MCSession(
+            peer: localPeerID,
+            securityIdentity: nil,
+            encryptionPreference: .optional
+        )
+        newSession.delegate = self
+        lock.withLock { $0.session = newSession }
         Log.transport.info("MCSession recreated")
     }
 
@@ -221,17 +258,24 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     @MainActor func recreateSessionWithFreshPeerID() {
         let displayName = localPeerID.displayName
         localPeerID = MCPeerID(displayName: displayName)
-        lock.withLock { state in
-            state.session?.disconnect()
-            let newSession = MCSession(
-                peer: localPeerID,
-                securityIdentity: nil,
-                encryptionPreference: .optional
-            )
-            newSession.delegate = self
-            state.session = newSession
+
+        // Extract old session, nil delegate, disconnect OUTSIDE the lock.
+        let oldSession = lock.withLock { state -> MCSession? in
+            let old = state.session
+            state.session = nil
             state.connectedPeer = nil
+            return old
         }
+        oldSession?.delegate = nil
+        oldSession?.disconnect()
+
+        let newSession = MCSession(
+            peer: localPeerID,
+            securityIdentity: nil,
+            encryptionPreference: .optional
+        )
+        newSession.delegate = self
+        lock.withLock { $0.session = newSession }
         Log.transport.info("MCPeerID + MCSession recreated (fresh DTLS identity)")
     }
 
@@ -257,6 +301,14 @@ extension PeerTransport: MCSessionDelegate {
         peer peerID: MCPeerID,
         didChange state: MCSessionState
     ) {
+        // Guard against callbacks from stale sessions (race window between
+        // nilling delegate and MC delivering the callback).
+        let isCurrentSession = lock.withLock { $0.session === session }
+        guard isCurrentSession else {
+            Log.transport.debug("Ignoring callback from stale MCSession (\(state.rawValue))")
+            return
+        }
+
         switch state {
         case .connected:
             lock.withLock { $0.connectedPeer = peerID }
@@ -288,6 +340,9 @@ extension PeerTransport: MCSessionDelegate {
     }
 
     nonisolated func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
+        // Ignore data from stale sessions
+        let isCurrentSession = lock.withLock { $0.session === session }
+        guard isCurrentSession else { return }
         guard let type = FrameSerializer.frameType(of: data) else { return }
 
         switch type {
@@ -355,16 +410,15 @@ extension PeerTransport: MCNearbyServiceBrowserDelegate {
         discoveredPeersContinuation.yield(peers)
         Log.transport.info("Found peer: \(peerID.displayName)")
 
-        let shouldAutoInvite = lock.withLock { state in
-            if state.autoInviteOnDiscover {
-                state.autoInviteOnDiscover = false
-                return true
-            }
-            return false
-        }
+        // Auto-invite is persistent (not one-shot) — it stays active until
+        // explicitly cleared by setAutoInviteOnDiscover(false). This handles the
+        // case where the host recreates its MCPeerID causing a Lost→Found cycle:
+        // the first Found may be for a stale peer, but auto-invite stays active
+        // to catch the real new MCPeerID when it appears.
+        let shouldAutoInvite = lock.withLock { $0.autoInviteOnDiscover }
         if shouldAutoInvite {
             invite(peer: peerID)
-            Log.transport.info("Auto-invited peer for reconnection: \(peerID.displayName)")
+            Log.transport.info("Auto-invited peer: \(peerID.displayName)")
         }
     }
 

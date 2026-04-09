@@ -145,6 +145,7 @@ final class SessionCoordinator {
         connectTimeoutTask = nil
         transport.stopAdvertising()
         transport.stopBrowsing()
+        transport.setAutoInviteOnDiscover(false)
         transport.disconnect()
         transport.recreateSessionWithFreshPeerID()
         routeManager.deactivateSession()
@@ -662,6 +663,7 @@ extension SessionCoordinator: PeerTransportDelegate {
             self.connectedPeerName = peerID.displayName
             self.transport.stopAdvertising()
             self.transport.stopBrowsing()
+            self.transport.setAutoInviteOnDiscover(false)
             self.recovery.handleReconnectSucceeded()
             self.reconnectionAttempted = false
             self.reconnectTimeoutTask?.cancel()
@@ -700,33 +702,38 @@ extension SessionCoordinator: PeerTransportDelegate {
                 self.recovery.handlePeerDisconnected()
                 self.sessionState = .reconnecting
             case .connecting:
-                // Connection attempt failed (e.g., AWDL/DTLS race).
-                self.connectRetryCount += 1
-                if self.connectRetryCount >= Self.maxConnectRetries {
-                    Log.session.error("Connection failed after \(self.connectRetryCount) retries — giving up")
-                    self.cancelConnecting()
-                } else {
-                    // Asymmetric retry timing: the guest (active, sends invitations) retries
-                    // fast, while the host (passive, advertises) waits longer. This breaks
-                    // DTLS race conditions where both sides retry simultaneously.
-                    let delayMs: Int = if self.role == .host {
-                        2000 + Int.random(in: 0...1000)   // Host: 2-3s
-                    } else {
-                        500 + Int.random(in: 0...500)      // Guest: 0.5-1s
-                    }
-                    self.connectionStatusMessage = "Connection dropped — retrying (\(self.connectRetryCount)/\(Self.maxConnectRetries))…"
-                    Log.session.warning("Connection attempt failed (\(self.connectRetryCount)/\(Self.maxConnectRetries)), retrying in \(delayMs)ms...")
+                if self.role == .host {
+                    // Host is passive — it advertises and accepts invitations.
+                    // Failed incoming invitations are NOT the host's fault; they
+                    // come from the guest's retries hitting stale DTLS state.
+                    // Don't count these as retries. Just recreate cleanly and
+                    // re-advertise. The 30s timeout is the only thing that ends it.
+                    Log.session.info("Host: incoming connection failed — recreating and re-advertising")
+                    self.connectionStatusMessage = "Waiting for connection…"
                     self.handshake?.reset()
+                    self.transport.stopAdvertising()
                     self.transport.recreateSessionWithFreshPeerID()
                     Task {
-                        try? await Task.sleep(for: .milliseconds(delayMs))
+                        try? await Task.sleep(for: .milliseconds(500))
                         guard self.sessionState == .connecting else { return }
-                        if self.role == .host {
-                            self.transport.startAdvertising()
-                        } else {
-                            // Auto-invite the first discovered peer so the retry
-                            // doesn't sit idle waiting for a user tap (the UI shows
-                            // the "Connecting…" spinner, not the peer list).
+                        self.transport.startAdvertising()
+                    }
+                } else {
+                    // Guest is the active party — count retries.
+                    self.connectRetryCount += 1
+                    if self.connectRetryCount >= Self.maxConnectRetries {
+                        Log.session.error("Connection failed after \(self.connectRetryCount) retries — giving up")
+                        self.cancelConnecting()
+                    } else {
+                        let delayMs = 500 + Int.random(in: 0...500)  // Guest: 0.5-1s
+                        self.connectionStatusMessage = "Connection dropped — retrying (\(self.connectRetryCount)/\(Self.maxConnectRetries))…"
+                        Log.session.warning("Guest: connection attempt failed (\(self.connectRetryCount)/\(Self.maxConnectRetries)), retrying in \(delayMs)ms...")
+                        self.handshake?.reset()
+                        self.transport.stopBrowsing()
+                        self.transport.recreateSessionWithFreshPeerID()
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(delayMs))
+                            guard self.sessionState == .connecting else { return }
                             self.transport.setAutoInviteOnDiscover(true)
                             self.transport.startBrowsing()
                         }
