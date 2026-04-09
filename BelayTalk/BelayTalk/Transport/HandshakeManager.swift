@@ -128,6 +128,7 @@ nonisolated final class HandshakeManager: @unchecked Sendable {
         // This handles the case where reliable messages arrive in order but
         // we haven't processed CAPS yet due to timing
         case (.sentCaps, .ready, false):
+            Log.transport.warning("Handshake: READY received before CAPS — CAPS validation skipped")
             transport.sendControl(ControlFrame(message: .start))
             lock.withLock { $0.state = .completed }
             Log.transport.info("Handshake: received READY (before CAPS), sent START — complete")

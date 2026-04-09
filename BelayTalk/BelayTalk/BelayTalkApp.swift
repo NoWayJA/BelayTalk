@@ -56,7 +56,9 @@ struct BelayTalkApp: App {
         VStack(spacing: 16) {
             ProgressView()
                 .controlSize(.large)
-            Text("Waiting for connection…")
+            Text(coordinator.connectionStatusMessage.isEmpty
+                 ? "Waiting for connection…"
+                 : coordinator.connectionStatusMessage)
                 .font(.headline)
             Text("Another device can join your session")
                 .font(.subheadline)

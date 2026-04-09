@@ -12,7 +12,9 @@ struct PeerBrowserView: View {
                 ContentUnavailableView(
                     "Searching for Sessions",
                     systemImage: "antenna.radiowaves.left.and.right",
-                    description: Text("Make sure the other device is hosting a session nearby.")
+                    description: Text(coordinator.connectionStatusMessage.isEmpty
+                        ? "Make sure the other device is hosting a session nearby."
+                        : coordinator.connectionStatusMessage)
                 )
             } else {
                 List(peers, id: \.displayName) { peer in

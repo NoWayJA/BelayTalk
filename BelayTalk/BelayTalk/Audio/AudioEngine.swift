@@ -22,7 +22,7 @@ nonisolated final class AudioEngine: @unchecked Sendable {
     private let jitterBuffer = JitterBuffer()
 
     /// Maximum number of buffers queued on the player node to prevent unbounded latency.
-    private static let maxScheduledBuffers = 4
+    private static let maxScheduledBuffers = 2
 
     /// Pre-allocated silence buffer for background keep-alive.
     /// iOS suspends background audio apps that stop producing output,
@@ -44,6 +44,7 @@ nonisolated final class AudioEngine: @unchecked Sendable {
         var isMuted = false
         var playbackTimer: DispatchSourceTimer?
         var scheduledBufferCount = 0
+        var residualSamples: [Float] = []
     }
 
     weak var delegate: AudioEngineDelegate?
@@ -85,6 +86,7 @@ nonisolated final class AudioEngine: @unchecked Sendable {
         lock.withLock { state in
             state.isRunning = true
             state.scheduledBufferCount = 0
+            state.residualSamples.removeAll()
         }
         startPlaybackPump()
 
@@ -98,6 +100,7 @@ nonisolated final class AudioEngine: @unchecked Sendable {
             let t = state.playbackTimer
             state.playbackTimer = nil
             state.scheduledBufferCount = 0
+            state.residualSamples.removeAll()
             return t
         }
 
@@ -149,7 +152,6 @@ nonisolated final class AudioEngine: @unchecked Sendable {
             ) else { return }
             processBuffer = converted
         } else if hardwareFormat.commonFormat != .pcmFormatFloat32 {
-            // Rare: hardware already at 16kHz but wrong format
             guard let converted = AudioFormatConverter.convertSampleRate(
                 from: buffer,
                 to: AudioConstants.processingFormat
@@ -159,26 +161,67 @@ nonisolated final class AudioEngine: @unchecked Sendable {
             processBuffer = buffer
         }
 
-        // Convert Float32 → Int16 wire data
-        guard let wireData = AudioFormatConverter.float32ToInt16Data(processBuffer) else { return }
+        guard let floatData = processBuffer.floatChannelData?[0] else { return }
+        let frameCount = Int(processBuffer.frameLength)
+        guard frameCount > 0 else { return }
 
-        let seq = lock.withLock { state -> UInt32 in
-            let s = state.sequenceNumber
-            state.sequenceNumber = s &+ 1
-            return s
+        // Copy samples out of the buffer pointer
+        let newSamples = Array(UnsafeBufferPointer(start: floatData, count: frameCount))
+
+        // Prepend any residual samples from previous callback, then chunk into 320-sample frames
+        let allSamples: [Float] = lock.withLock { state in
+            let combined = state.residualSamples + newSamples
+            state.residualSamples.removeAll()
+            return combined
         }
 
-        let header = AudioFrameHeader(
-            sequenceNumber: seq,
-            timestamp: mach_absolute_time(),
-            codec: .pcmInt16,
-            sampleRate: UInt16(AudioConstants.sampleRate),
-            durationMs: UInt16(AudioConstants.frameDurationMs),
-            txState: 0,
-            reserved: 0
-        )
+        let chunkSize = AudioConstants.samplesPerFrame  // 320
+        var offset = 0
 
-        delegate?.audioEngine(self, didCapture: header, payload: wireData)
+        while offset + chunkSize <= allSamples.count {
+            let chunk = Array(allSamples[offset..<(offset + chunkSize)])
+            offset += chunkSize
+
+            guard let wireData = float32ChunkToInt16Data(chunk) else { continue }
+
+            let seq = lock.withLock { state -> UInt32 in
+                let s = state.sequenceNumber
+                state.sequenceNumber = s &+ 1
+                return s
+            }
+
+            let header = AudioFrameHeader(
+                sequenceNumber: seq,
+                timestamp: mach_absolute_time(),
+                codec: .pcmInt16,
+                sampleRate: UInt16(AudioConstants.sampleRate),
+                durationMs: UInt16(AudioConstants.frameDurationMs),
+                txState: 0,
+                reserved: 0
+            )
+
+            delegate?.audioEngine(self, didCapture: header, payload: wireData)
+        }
+
+        // Store leftover samples for the next callback
+        if offset < allSamples.count {
+            let residual = Array(allSamples[offset...])
+            lock.withLock { $0.residualSamples = residual }
+        }
+    }
+
+    /// Convert a Float32 sample array directly to Int16 wire data.
+    private func float32ChunkToInt16Data(_ samples: [Float]) -> Data? {
+        guard !samples.isEmpty else { return nil }
+        var data = Data(count: samples.count * AudioConstants.bytesPerSample)
+        data.withUnsafeMutableBytes { rawBuffer in
+            guard let int16Ptr = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return }
+            for i in 0..<samples.count {
+                let clamped = max(-1.0, min(1.0, samples[i]))
+                int16Ptr[i] = Int16(clamped * Float(Int16.max))
+            }
+        }
+        return data
     }
 
     // MARK: - Playback Pump

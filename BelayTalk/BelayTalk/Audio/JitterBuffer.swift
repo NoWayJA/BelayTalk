@@ -15,7 +15,7 @@ nonisolated final class JitterBuffer: @unchecked Sendable {
     private struct State {
         var buffer: [UInt32: Data] = [:]
         var nextExpectedSeq: UInt32 = 0
-        var depthFrames: Int = 3
+        var depthFrames: Int = 2
         var minDepth: Int = 2   // 40ms
         var maxDepth: Int = 6   // 120ms
         var latePackets: UInt64 = 0
@@ -124,7 +124,7 @@ nonisolated final class JitterBuffer: @unchecked Sendable {
             state.buffer.removeAll()
             state.nextExpectedSeq = 0
             state.highestInsertedSeq = 0
-            state.depthFrames = 3
+            state.depthFrames = 2
             state.latePackets = 0
             state.initialized = false
         }

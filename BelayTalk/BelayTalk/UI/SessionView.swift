@@ -25,7 +25,9 @@ struct SessionView: View {
                 VStack(spacing: 12) {
                     ProgressView()
                         .controlSize(.large)
-                    Text("Reconnecting...")
+                    Text(coordinator.connectionStatusMessage.isEmpty
+                         ? "Reconnecting…"
+                         : coordinator.connectionStatusMessage)
                         .font(.title3.weight(.semibold))
                     Text("Attempt \(coordinator.reconnectAttempt) of \(coordinator.recovery.maxAttempts)")
                         .font(.subheadline)

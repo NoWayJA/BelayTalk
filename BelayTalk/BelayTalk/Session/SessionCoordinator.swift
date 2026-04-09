@@ -18,6 +18,8 @@ final class SessionCoordinator {
     private(set) var role: ConnectionRole?
     /// Current reconnection attempt number (0 = not reconnecting). Observable for UI.
     private(set) var reconnectAttempt: Int = 0
+    /// Granular status message for the UI during connection lifecycle.
+    private(set) var connectionStatusMessage: String = ""
 
     let metrics = SessionMetrics()
     let settings = AppSettings()
@@ -46,6 +48,10 @@ final class SessionCoordinator {
     private static let maxConnectRetries = 3
     /// How long to wait for the initial connection before timing out.
     private static let connectTimeoutSeconds: TimeInterval = 30
+    /// Grace period: during the first few seconds after audio startup,
+    /// MC disconnects are expected (BT HFP negotiation disrupts AWDL).
+    private var isInAudioStartupGrace = false
+    private var audioStartupGraceTask: Task<Void, Never>?
 
     init() {
         transport = PeerTransport(displayName: settings.displayName)
@@ -91,6 +97,7 @@ final class SessionCoordinator {
         role = .host
         connectRetryCount = 0
         sessionState = .connecting
+        connectionStatusMessage = "Advertising session…"
         transport.startAdvertising()
         startConnectTimeout()
         Log.session.info("Hosting session — auto-accepting connections")
@@ -101,12 +108,14 @@ final class SessionCoordinator {
         role = .guest
         connectRetryCount = 0
         sessionState = .connecting
+        connectionStatusMessage = "Searching for peers…"
         transport.startBrowsing()
         startConnectTimeout()
         Log.session.info("Joining session — browsing for peers")
     }
 
     func invitePeer(_ peerID: MCPeerID) {
+        connectionStatusMessage = "Connecting to \(peerID.displayName)…"
         transport.invite(peer: peerID)
     }
 
@@ -120,10 +129,12 @@ final class SessionCoordinator {
         transport.stopBrowsing()
         transport.disconnect()
         transport.recreateSession()
+        routeManager.deactivateSession()
         handshake?.reset()
         connectedPeerName = nil
         role = nil
         connectRetryCount = 0
+        connectionStatusMessage = ""
         sessionState = .ready
     }
 
@@ -298,17 +309,49 @@ final class SessionCoordinator {
         switch result {
         case .success(let caps):
             Log.session.info("Handshake complete: protocol v\(caps.protocolVersion)")
-            beginActiveSession()
+            if sessionState == .active && audioEngine.isRunning {
+                // Re-handshake during grace period — audio already running, nothing more to do
+                Log.session.info("Handshake succeeded on existing active session (grace reconnect)")
+            } else {
+                beginActiveSession()
+            }
         case .failure(let error):
             Log.session.error("Handshake failed: \(String(describing: error))")
-            tearDown()
-            sessionState = .ready
+            if isInAudioStartupGrace {
+                // During grace, a handshake failure is non-fatal — connection may re-establish
+                Log.session.info("Handshake failed during grace period — waiting for reconnect")
+            } else {
+                tearDown()
+                sessionState = .ready
+            }
         }
     }
 
     private func beginActiveSession() {
         sessionState = .active
+        connectionStatusMessage = "Starting audio…"
         metrics.markSessionStart()
+        vad.reset()
+
+        // Start the audio startup grace period BEFORE configuring audio.
+        // BT HFP negotiation during .voiceChat mode setup disrupts AWDL,
+        // causing MC disconnects. These are transient and expected.
+        isInAudioStartupGrace = true
+        audioStartupGraceTask?.cancel()
+        audioStartupGraceTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            self.isInAudioStartupGrace = false
+            self.audioStartupGraceTask = nil
+            Log.session.info("Audio startup grace period ended")
+            // If we disconnected during grace and never reconnected, trigger recovery now
+            if !self.transport.isConnected && self.sessionState == .active {
+                Log.session.warning("Still disconnected after grace period — triggering recovery")
+                self.recovery.handlePeerDisconnected()
+                self.sessionState = .reconnecting
+            }
+        }
 
         do {
             // Configure audio session AFTER MC handshake is complete.
@@ -318,6 +361,9 @@ final class SessionCoordinator {
             try audioEngine.start()
         } catch {
             Log.session.error("Failed to start audio: \(error.localizedDescription)")
+            isInAudioStartupGrace = false
+            audioStartupGraceTask?.cancel()
+            audioStartupGraceTask = nil
             tearDown()
             sessionState = .ready
             return
@@ -330,6 +376,7 @@ final class SessionCoordinator {
         recovery.recreateStream()
         startMonitoring()
 
+        connectionStatusMessage = "Active"
         Log.session.info("Session active")
     }
 
@@ -406,6 +453,7 @@ final class SessionCoordinator {
         case .reconnect(let attempt):
             sessionState = .reconnecting
             reconnectAttempt = attempt
+            connectionStatusMessage = "Reconnecting (attempt \(attempt))…"
             metrics.incrementReconnectCount()
             reconnectionAttempted = true
 
@@ -474,8 +522,13 @@ final class SessionCoordinator {
         connectTimeoutTask = nil
         reconnectTimeoutTask?.cancel()
         reconnectTimeoutTask = nil
+        audioStartupGraceTask?.cancel()
+        audioStartupGraceTask = nil
+        isInAudioStartupGrace = false
 
         audioEngine.stop()
+        routeManager.deactivateSession()
+        vad.reset()
         remoteControl.deactivate()
         transport.stopAdvertising()
         transport.stopBrowsing()
@@ -491,6 +544,7 @@ final class SessionCoordinator {
         reconnectionAttempted = false
         reconnectAttempt = 0
         connectRetryCount = 0
+        connectionStatusMessage = ""
         UIApplication.shared.isIdleTimerDisabled = false
 
         Log.session.info("Session torn down")
@@ -544,7 +598,16 @@ extension SessionCoordinator: PeerTransportDelegate {
             self.reconnectionAttempted = false
             self.reconnectTimeoutTask?.cancel()
             self.reconnectTimeoutTask = nil
-            Log.session.info("Peer connected: \(peerID.displayName)")
+
+            if self.isInAudioStartupGrace && self.sessionState == .active {
+                // Reconnected during grace — audio is already running.
+                // Just re-handshake on the new MC connection.
+                self.connectionStatusMessage = "Reconnected — re-handshaking…"
+                Log.session.info("Peer reconnected during audio startup grace — re-handshaking")
+            } else {
+                self.connectionStatusMessage = "Connected — handshaking…"
+                Log.session.info("Peer connected: \(peerID.displayName)")
+            }
             self.startHandshake()
         }
     }
@@ -553,6 +616,12 @@ extension SessionCoordinator: PeerTransportDelegate {
         Task { @MainActor in
             switch self.sessionState {
             case .active, .interrupted, .routeFailed:
+                if self.isInAudioStartupGrace {
+                    // During audio startup, MC disconnects are expected due to
+                    // BT HFP negotiation disrupting AWDL. Don't stop audio or trigger recovery.
+                    Log.session.info("Disconnect during audio startup grace — ignoring (BT/AWDL expected)")
+                    return
+                }
                 // Stop audio IMMEDIATELY to prevent DTLS error flood.
                 // The MCSession is dead — sending into it produces thousands of
                 // "Failed to send DTLS packet" errors until the delegate fires.
@@ -568,6 +637,7 @@ extension SessionCoordinator: PeerTransportDelegate {
                     self.cancelConnecting()
                 } else {
                     // Stay in .connecting and retry with a short delay to let MC settle.
+                    self.connectionStatusMessage = "Connection dropped — retrying (\(self.connectRetryCount)/\(Self.maxConnectRetries))…"
                     Log.session.warning("Connection attempt failed (\(self.connectRetryCount)/\(Self.maxConnectRetries)), retrying in 1s...")
                     self.handshake?.reset()
                     self.transport.recreateSession()
@@ -589,6 +659,21 @@ extension SessionCoordinator: PeerTransportDelegate {
                 break
             default:
                 break
+            }
+        }
+    }
+
+    nonisolated func transport(_ transport: PeerTransport, didFailToStartWithError error: Error) {
+        Task { @MainActor in
+            Log.session.error("Transport failed to start: \(error.localizedDescription)")
+            self.connectionStatusMessage = "Network error — check WiFi/Bluetooth"
+            // If still in connecting state, cancel after a brief delay to show the message
+            if self.sessionState == .connecting {
+                Task {
+                    try? await Task.sleep(for: .seconds(3))
+                    guard self.sessionState == .connecting else { return }
+                    self.cancelConnecting()
+                }
             }
         }
     }

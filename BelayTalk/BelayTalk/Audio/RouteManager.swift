@@ -9,6 +9,7 @@ nonisolated protocol RouteManaging: Sendable {
     var routeChanges: AsyncStream<RouteState> { get }
     var interruptions: AsyncStream<InterruptionEvent> { get }
     func configureSession() throws
+    func deactivateSession()
 }
 
 // MARK: - Implementation
@@ -64,6 +65,17 @@ nonisolated final class RouteManager: RouteManaging, @unchecked Sendable {
         let route = detectRoute()
         lock.withLock { $0 = route }
         Log.route.info("Audio session configured, route: \(route.rawValue)")
+    }
+
+    func deactivateSession() {
+        do {
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+            Log.route.info("Audio session deactivated")
+        } catch {
+            // Deactivation can fail if another app has the session active.
+            // This is non-fatal — the session will be reconfigured on next use.
+            Log.route.warning("Audio session deactivation failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Route Detection

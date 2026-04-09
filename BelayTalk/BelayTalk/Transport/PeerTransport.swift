@@ -9,6 +9,7 @@ nonisolated protocol PeerTransportDelegate: AnyObject, Sendable {
     func transport(_ transport: PeerTransport, didReceiveControl frame: ControlFrame)
     func transport(_ transport: PeerTransport, peerDidConnect peerID: MCPeerID)
     func transport(_ transport: PeerTransport, peerDidDisconnect peerID: MCPeerID)
+    func transport(_ transport: PeerTransport, didFailToStartWithError error: Error)
 }
 
 // MARK: - Peer Transport
@@ -308,6 +309,7 @@ extension PeerTransport: MCNearbyServiceAdvertiserDelegate {
 
     nonisolated func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
         Log.transport.error("Failed to start advertising: \(error.localizedDescription)")
+        delegate?.transport(self, didFailToStartWithError: error)
     }
 }
 
@@ -350,5 +352,6 @@ extension PeerTransport: MCNearbyServiceBrowserDelegate {
 
     nonisolated func browser(_ browser: MCNearbyServiceBrowser, didNotStartBrowsingForPeers error: Error) {
         Log.transport.error("Failed to start browsing: \(error.localizedDescription)")
+        delegate?.transport(self, didFailToStartWithError: error)
     }
 }
