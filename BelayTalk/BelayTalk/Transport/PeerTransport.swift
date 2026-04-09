@@ -220,6 +220,11 @@ nonisolated final class PeerTransport: NSObject, @unchecked Sendable {
     var isConnected: Bool {
         lock.withLock { $0.connectedPeer != nil }
     }
+
+    /// Snapshot of currently discovered peers (for polling fallback when AsyncStream misses updates).
+    var currentDiscoveredPeers: [MCPeerID] {
+        lock.withLock { $0.discoveredPeers }
+    }
 }
 
 // MARK: - MCSessionDelegate

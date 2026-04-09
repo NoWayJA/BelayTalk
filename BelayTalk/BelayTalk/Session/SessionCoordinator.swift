@@ -129,6 +129,14 @@ final class SessionCoordinator {
         transport.invite(peer: peerID)
     }
 
+    /// Restart peer browsing when discovery appears stale.
+    /// Called by PeerBrowserView when no peers are found after a timeout.
+    func restartBrowsing() {
+        guard sessionState == .connecting, role == .guest else { return }
+        Log.session.info("Restarting peer browsing (no peers found)")
+        transport.startBrowsing()
+    }
+
     /// Cancel a connection attempt (before session is active). No control frame needed.
     func cancelConnecting() {
         guard sessionState == .connecting else { return }
@@ -356,7 +364,7 @@ final class SessionCoordinator {
         isInAudioStartupGrace = true
         audioStartupGraceTask?.cancel()
         audioStartupGraceTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(5))
+            try? await Task.sleep(for: .seconds(8))
             guard !Task.isCancelled else { return }
             guard let self else { return }
             self.isInAudioStartupGrace = false
@@ -495,16 +503,16 @@ final class SessionCoordinator {
                 Log.session.info("Recovery: re-browsing as guest (will auto-invite)")
             }
 
-            // Set a timeout — if not reconnected in time, schedule next attempt.
-            // MC needs 15-20s for AWDL to fully stabilize after BT HFP release.
-            // A shorter timeout (e.g. 10s) kills in-flight connections that would
-            // have succeeded, wasting recovery attempts.
+            // Safety-net timeout — only fires if MC gets stuck (never reaches
+            // connected or notConnected). Fast failures are handled in peerDidDisconnect
+            // which cancels this timeout and retries immediately.
             reconnectTimeoutTask?.cancel()
             reconnectTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(20))
+                try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled else { return }
                 guard let self, self.sessionState == .reconnecting else { return }
-                Log.session.warning("Recovery: attempt \(attempt) timed out after 20s, scheduling next")
+                self.reconnectTimeoutTask = nil  // Mark as handled to prevent double-scheduling
+                Log.session.warning("[\(self.elapsed)] Recovery: attempt \(attempt) timed out after 10s, scheduling next")
                 self.recovery.scheduleReconnect()
             }
 
@@ -663,23 +671,40 @@ extension SessionCoordinator: PeerTransportDelegate {
                     self.cancelConnecting()
                 } else {
                     // Stay in .connecting and retry with a short delay to let MC settle.
+                    // Add random jitter (0-500ms) to break symmetry when both sides
+                    // retry simultaneously, causing DTLS race conditions.
+                    let jitterMs = Int.random(in: 0...500)
+                    let delayMs = 1000 + jitterMs
                     self.connectionStatusMessage = "Connection dropped — retrying (\(self.connectRetryCount)/\(Self.maxConnectRetries))…"
-                    Log.session.warning("Connection attempt failed (\(self.connectRetryCount)/\(Self.maxConnectRetries)), retrying in 1s...")
+                    Log.session.warning("Connection attempt failed (\(self.connectRetryCount)/\(Self.maxConnectRetries)), retrying in \(delayMs)ms...")
                     self.handshake?.reset()
                     self.transport.recreateSession()
                     Task {
-                        try? await Task.sleep(for: .seconds(1))
+                        try? await Task.sleep(for: .milliseconds(delayMs))
                         guard self.sessionState == .connecting else { return }
                         if self.role == .host {
                             self.transport.startAdvertising()
                         } else {
+                            // Auto-invite the first discovered peer so the retry
+                            // doesn't sit idle waiting for a user tap (the UI shows
+                            // the "Connecting…" spinner, not the peer list).
+                            self.transport.setAutoInviteOnDiscover(true)
                             self.transport.startBrowsing()
                         }
                     }
                 }
             case .reconnecting:
-                // Another disconnect during reconnection — will be retried by timeout
-                Log.session.warning("Peer disconnected during reconnection")
+                // MC connection failed fast during recovery. Don't wait for the timeout —
+                // cancel it and schedule the next attempt immediately (with backoff).
+                // MC connections either succeed fast (~3-5s) or fail fast (~2-3s).
+                if self.reconnectTimeoutTask != nil {
+                    self.reconnectTimeoutTask?.cancel()
+                    self.reconnectTimeoutTask = nil
+                    Log.session.warning("[\(self.elapsed)] Peer disconnected during reconnection — scheduling next attempt")
+                    self.recovery.scheduleReconnect()
+                } else {
+                    Log.session.warning("Peer disconnected during reconnection (timeout already handled)")
+                }
             case .ending, .ended, .ready:
                 // We initiated the disconnect, or session is already over — ignore
                 break
